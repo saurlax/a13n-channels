@@ -1,0 +1,17 @@
+.a13n-channels-overview {
+  max-width: 640px;
+  padding: 24px;
+  border-radius: 12px;
+  background: var(--a13n-surface);
+}
+.a13n-channels-overview h2 {
+  margin: 0 0 8px;
+  font-size: 15px;
+  font-weight: 500;
+}
+.a13n-channels-overview p,
+.a13n-channels-overview dt {
+  color: var(--a13n-secondary);
+}
+.a13n-channels-overview dl { margin: 24px 0 0; }
+.a13n-channels-overview dd { margin: 4px 0 0; overflow-wrap: anywhere; }

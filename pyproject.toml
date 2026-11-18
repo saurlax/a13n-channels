@@ -1,0 +1,38 @@
+[project]
+name = "a13n-channels"
+version = "0.1.0"
+description = "Channels"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = ["a13n-service"]
+
+[project.entry-points."a13n_service.app_plugins"]
+"saurlax.channels" = "a13n_channels.app:definition"
+
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/a13n_channels"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/a13n_channels/static" = "a13n_channels/static"
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "frontend", "tests", "scripts", "README.md", "Makefile", ".python-version", ".service-ref"]
+exclude = ["frontend/node_modules"]
+
+[tool.hatch.build.targets.sdist.force-include]
+"src/a13n_channels/static" = "src/a13n_channels/static"
+
+[tool.uv.workspace]
+members = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--confcutdir=."
+
+[tool.ruff]
+target-version = "py313"
+line-length = 120
