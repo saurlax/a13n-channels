@@ -15,6 +15,7 @@ from a13n_service.infra.ids import new_object_id
 from a13n_channels.github import GITHUB_KINDS, LOGIN_PATTERN, GitHubBinding
 from a13n_channels.messages import ChannelMessage
 from a13n_channels.qq import QQCreate, QQSecret
+from a13n_channels.qq_content import QQInbound
 from a13n_channels.routing import SCHEMA, Route, RouteInput, enqueue, github_channel_ids, read_routes, validate_route
 from a13n_channels.weixin import WeixinCredentials
 
@@ -272,20 +273,49 @@ class Accounts:
             name=account["name"], app_id=account["app_id"], app_secret=secret.decode(), qq_intents=account["intents"]
         )
 
-    async def receive(self, incoming: ChannelMessage, generation: str) -> None:
-        await asyncio.to_thread(self._receive_qq, incoming, generation)
+    async def receive(self, incoming: ChannelMessage, generation: str) -> bool:
+        return await asyncio.to_thread(self._receive_qq, incoming, generation)
 
-    def _receive_qq(self, incoming: ChannelMessage, generation: str) -> None:
+    def _receive_qq(self, incoming: ChannelMessage, generation: str) -> bool:
         with self.transaction() as db:
-            row = db.execute(
-                """INSERT OR IGNORE INTO qq_messages (channel_id, account_id, message_id, payload)
-                   SELECT id, app_id, ?, ? FROM qq_accounts WHERE id = ? AND app_secret = ?
-                   RETURNING account_id""",
-                (incoming.id, incoming.model_dump_json(), incoming.channel_id, generation),
+            account = db.execute(
+                "SELECT app_id, workspace_id, organization_id FROM qq_accounts WHERE id = ? AND app_secret = ?",
+                (incoming.channel_id, generation),
             ).fetchone()
-            if row:
-                workspace = db.execute("SELECT workspace_id FROM qq_accounts WHERE id = ?", (incoming.channel_id,))
-                enqueue(db, workspace.fetchone()["workspace_id"], row["account_id"], incoming)
+            if account is None:
+                return False
+            payload = incoming.model_dump(mode="json", exclude_defaults=True)
+            if isinstance(incoming, QQInbound) and (incoming.attachment_urls or incoming.event_reply_id):
+                payload["qq_context"] = self.seal(
+                    account["organization_id"],
+                    "channels.qq_messages",
+                    "context",
+                    self.qq_message_key(incoming.channel_id, account["app_id"], incoming.id),
+                    json.dumps({"urls": incoming.attachment_urls, "event_reply_id": incoming.event_reply_id}).encode(),
+                )
+            saved = db.execute(
+                """INSERT OR IGNORE INTO qq_messages (channel_id, account_id, message_id, payload)
+                   VALUES (?, ?, ?, ?)""",
+                (incoming.channel_id, account["app_id"], incoming.id, json.dumps(payload, ensure_ascii=False)),
+            )
+            if saved.rowcount:
+                enqueue(db, account["workspace_id"], account["app_id"], incoming)
+            return bool(saved.rowcount)
+
+    @staticmethod
+    def qq_message_key(channel_id: str, account_id: str, message_id: str) -> str:
+        return json.dumps([channel_id, account_id, message_id], separators=(",", ":"))
+
+    def qq_message_context(self, account: sqlite3.Row, message_id: str, context: str) -> dict:
+        return json.loads(
+            self.unseal(
+                account["organization_id"],
+                "channels.qq_messages",
+                "context",
+                self.qq_message_key(account["id"], account["app_id"], message_id),
+                context,
+            )
+        )
 
     def seal(self, organization_id: str, table: str, column: str, row_id: str, value: bytes) -> str:
         return self.keys.protect(value, SecretLocation(organization_id, table, column, row_id)).model_dump_json()

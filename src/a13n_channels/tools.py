@@ -1,11 +1,15 @@
 """Workspace channel tools and conversation-scoped delivery tools."""
 
+import asyncio
+import json
+from contextlib import aclosing
 from hashlib import sha256
 from typing import TYPE_CHECKING, Annotated
 
 import httpx
 from a13n_harness import AbstractHarnessPlugin
 from a13n_harness.context import AgentContext
+from a13n_harness.environment.models import EnvironmentError
 from a13n_harness.plugin_factories import HarnessPluginFactory, HarnessPluginFactoryContext
 from a13n_service.infra.db import short_session
 from a13n_service.infra.errors import ServiceError
@@ -17,10 +21,19 @@ from a13n_service.tenancy.tables import OrganizationRow, WorkspaceRow
 from pydantic import BaseModel, Field, TypeAdapter, field_validator
 from pydantic_ai import ModelRetry, RunContext, Tool
 from pydantic_ai.capabilities import Capability
+from pydantic_ai.messages import BinaryContent, ToolReturn
 from sqlalchemy import select
 
 from a13n_channels.messages import ChannelMessage, ReplyText, message_table
-from a13n_channels.qq import ChannelId, QQConnection, QQConversationKind
+from a13n_channels.qq import ChannelId, QQConnection, QQConversationKind, QQRejected
+from a13n_channels.qq_content import (
+    MEDIA_LIMITS,
+    QQMedia,
+    QQRichContent,
+    image_type,
+    open_attachment,
+    validate_rich,
+)
 from a13n_channels.routing import select_route
 
 if TYPE_CHECKING:
@@ -28,6 +41,9 @@ if TYPE_CHECKING:
 
 FACTORY_KEY = "saurlax.channels"
 DELIVERY_FACTORY_KEY = "saurlax.channels.delivery"
+type MessageId = Annotated[str, Field(min_length=1, max_length=1024)]
+type AttachmentIndex = Annotated[int, Field(ge=1, le=16)]
+type EnvironmentPath = Annotated[str, Field(min_length=1, max_length=1024)]
 
 
 class ChannelToolSettings(BaseModel, extra="forbid"):
@@ -49,7 +65,7 @@ class ChannelToolSettings(BaseModel, extra="forbid"):
 class ChannelToolFactory(HarnessPluginFactory):
     configuration_model = ChannelToolSettings
     display_name = "Channels"
-    description = "Read channel history and send proactive QQ text messages."
+    description = "Read channel history and attachments, and send proactive QQ messages."
 
     def __init__(self) -> None:
         self.channels: ChannelsRuntime | None = None
@@ -125,6 +141,106 @@ async def read_messages(store, account, kind: str, conversation_id: str, limit: 
     ]
 
 
+async def history_message(store, account, kind: str, conversation_id: str, message_id: str) -> dict:
+    rows = await store.query(
+        f"""SELECT payload FROM {message_table(account["platform"])}
+           WHERE channel_id = ? AND account_id = ? AND message_id = ?
+             AND json_extract(payload, '$.kind') = ? AND json_extract(payload, '$.conversation_id') = ?""",
+        account["id"],
+        account["app_id"],
+        message_id,
+        kind,
+        conversation_id,
+    )
+    if not rows:
+        raise ModelRetry("Choose a message from the selected conversation's history.")
+    return json.loads(rows[0]["payload"])
+
+
+async def read_qq_attachment(
+    ctx: RunContext[AgentContext],
+    store,
+    account,
+    kind: str,
+    conversation_id: str,
+    message_id: str,
+    index: int,
+    save_path: str | None,
+) -> ToolReturn | dict:
+    if account["platform"] != "qq":
+        raise ModelRetry("Attachment reads are available for QQ.")
+    payload = await history_message(store, account, kind, conversation_id, message_id)
+    attachments = payload.get("attachments", [])
+    if not 1 <= index <= len(attachments) or not payload.get("qq_context"):
+        raise ModelRetry("Choose an attachment index from channel history.")
+    metadata = attachments[index - 1]
+    inline_image = save_path is None and metadata["kind"] in {"image", "sticker"}
+    if not inline_image and save_path is None:
+        raise ModelRetry("Supply an absolute Agent Environment save_path for this attachment.")
+    if save_path is not None and (not save_path.startswith("/") or "\\" in save_path):
+        raise ModelRetry("Use an absolute Agent Environment save_path.")
+    limit = 10 << 20 if inline_image else MEDIA_LIMITS.get(metadata["kind"], MEDIA_LIMITS["image"])
+    if metadata.get("size", 0) > limit:
+        raise ModelRetry("This attachment exceeds the size limit for this operation. Use save_path for large images.")
+    try:
+        context = store.qq_message_context(account, message_id, payload["qq_context"])
+        url = context["urls"][index - 1]
+        async with asyncio.timeout(45), open_attachment(url, ctx.deps.configuration.authorize_url) as response:
+            if response.status_code != 200:
+                raise ModelRetry("QQ could not serve this attachment. Ask the sender to resend it.")
+            if response.headers.get("Content-Encoding", "identity").lower() != "identity":
+                raise ModelRetry("QQ returned an unsupported attachment encoding.")
+            length = response.headers.get("Content-Length")
+            if length is not None and int(length) > limit:
+                raise ModelRetry("This attachment exceeds the size limit for this operation.")
+
+            async def chunks():
+                size = 0
+                async for chunk in response.aiter_bytes():
+                    size += len(chunk)
+                    if size > limit:
+                        raise ModelRetry("This attachment exceeds the size limit for this operation.")
+                    yield chunk
+
+            if inline_image:
+                content = b"".join([chunk async for chunk in chunks()])
+                return ToolReturn(
+                    return_value=metadata, content=[BinaryContent(data=content, media_type=image_type(content))]
+                )
+            await ctx.deps.environment.files.write_bytes_stream(save_path, chunks(), mode="create")
+            return {**metadata, "path": save_path}
+    except (EnvironmentError, httpx.HTTPError, ValueError, OSError, ServiceError, IndexError):
+        raise ModelRetry(
+            "The QQ attachment could not be read or saved. Check its availability and the Environment path."
+        ) from None
+
+
+async def prepare_qq_send(
+    ctx: RunContext[AgentContext], kind: str, text: str | None, rich: QQRichContent | None
+) -> bytes | None:
+    try:
+        validate_rich(kind, text, rich)
+        if isinstance(rich, QQMedia) and rich.path is not None:
+            limit = MEDIA_LIMITS[rich.kind]
+            buffer = bytearray()
+            async with aclosing(ctx.deps.environment.files.read_bytes_stream(rich.path)) as stream:
+                async for chunk in stream:
+                    if len(buffer) + len(chunk) > limit:
+                        raise ValueError("The file exceeds the QQ media size limit.")
+                    buffer.extend(chunk)
+            if not buffer:
+                raise ValueError("The media file is empty.")
+            data = bytes(buffer)
+            if rich.kind == "image":
+                image_type(data)
+            return data
+    except ValueError as error:
+        raise ModelRetry(str(error)) from None
+    except (EnvironmentError, OSError):
+        raise ModelRetry("The Agent Environment could not read the media file.") from None
+    return None
+
+
 class WorkspaceChannelTools(AbstractHarnessPlugin):
     def __init__(self, plugin_id: str, factory: ChannelToolFactory, allowed: frozenset[str]) -> None:
         self._plugin_id = plugin_id
@@ -143,6 +259,8 @@ class WorkspaceChannelTools(AbstractHarnessPlugin):
                     Tool(self.channel_list_accounts),
                     Tool(self.channel_list_conversations),
                     Tool(self.channel_read_messages),
+                    Tool(self.channel_read_message),
+                    Tool(self.channel_read_attachment),
                     Tool(self.channel_send_proactive),
                 ],
             )
@@ -228,9 +346,36 @@ class WorkspaceChannelTools(AbstractHarnessPlugin):
         limit: Annotated[int, Field(ge=1, le=20)] = 10,
         before_id: Annotated[str, Field(max_length=1024)] | None = None,
     ) -> list[dict]:
-        """Read incoming text newest first. To read older messages, pass the last returned message ID as before_id."""
+        """Read incoming messages newest first. Pass the last message ID as before_id for older messages."""
         active, account = await self.account(ctx, channel_id)
         return await read_messages(active.store, account, kind, conversation_id, limit, before_id)
+
+    async def channel_read_message(
+        self,
+        ctx: RunContext[AgentContext],
+        channel_id: ChannelId,
+        kind: Annotated[str, Field(max_length=32)],
+        conversation_id: Annotated[str, Field(min_length=1, max_length=512)],
+        message_id: MessageId,
+    ) -> dict:
+        """Read the full stored text, structure, and attachment metadata for one message."""
+        active, account = await self.account(ctx, channel_id)
+        payload = await history_message(active.store, account, kind, conversation_id, message_id)
+        return ChannelMessage.model_validate(payload).model_dump()
+
+    async def channel_read_attachment(
+        self,
+        ctx: RunContext[AgentContext],
+        channel_id: ChannelId,
+        kind: QQConversationKind,
+        conversation_id: Annotated[str, Field(min_length=1, max_length=512)],
+        message_id: MessageId,
+        index: AttachmentIndex,
+        save_path: EnvironmentPath | None = None,
+    ) -> ToolReturn | dict:
+        """View a QQ image or sticker, or save an attachment to an absolute Agent Environment path."""
+        active, account = await self.account(ctx, channel_id)
+        return await read_qq_attachment(ctx, active.store, account, kind, conversation_id, message_id, index, save_path)
 
     async def channel_send_proactive(
         self,
@@ -238,18 +383,24 @@ class WorkspaceChannelTools(AbstractHarnessPlugin):
         channel_id: ChannelId,
         kind: QQConversationKind,
         conversation_id: Annotated[str, Field(min_length=1, max_length=512)],
-        text: ReplyText,
+        text: ReplyText | None = None,
+        rich: QQRichContent | None = None,
     ) -> dict:
-        """Send text to a QQ conversation without a source message, for example from a scheduled run."""
+        """Send text, media, Markdown, or a card to a QQ conversation without a source message."""
         active, account = await self.account(ctx, channel_id, sending=True)
         if account["platform"] != "qq":
-            return {"status": "unsupported", "reason": "Proactive text sending is supported for QQ."}
+            return {"status": "unsupported", "reason": "Proactive sending is supported for QQ."}
+        data = await prepare_qq_send(ctx, kind, text, rich)
+        if data is not None:
+            active, account = await self.account(ctx, channel_id, sending=True)
         qq = QQConnection(active.http, channel_id, active.store.credentials(account))
         try:
-            message_id = await qq.send_proactive(kind, conversation_id, text)
+            message_id = await qq.send_proactive(kind, conversation_id, text, rich=rich, data=data)
         except httpx.HTTPStatusError as error:
             code = error.response.status_code
-            return {"status": "rejected" if code < 500 else "unknown", "http_status": code}
+            return {"status": "rejected" if 400 <= code < 500 and code != 408 else "unknown", "http_status": code}
+        except QQRejected as error:
+            return {"status": "rejected", "message": str(error)}
         except (httpx.RequestError, ValueError, KeyError, TypeError):
             return {"status": "unknown"}
         return {"status": "sent", "message_id": message_id}
@@ -270,8 +421,16 @@ class ChannelTools(AbstractHarnessPlugin):
                 id=self.plugin_id,
                 instructions="Use channel_send_message to reply in the originating chat. Normal assistant text is "
                 "shown only in Console. Use channel_list_messages to inspect recent chat context. "
-                "Pass the message_id from Channel source to select which input to read or reply to.",
-                tools=[Tool(self.channel_list_messages), Tool(self.channel_send_message)],
+                "Pass the message_id from Channel source to select which input to read or reply to. "
+                "Use channel_view_attachment to inspect QQ images and stickers or save other files. "
+                "To send a generated image or sticker, pass rich={type:'media',path:'/absolute/environment/path'} "
+                "to channel_send_message.",
+                tools=[
+                    Tool(self.channel_list_messages),
+                    Tool(self.channel_get_message),
+                    Tool(self.channel_view_attachment),
+                    Tool(self.channel_send_message),
+                ],
             )
         ]
 
@@ -362,27 +521,75 @@ class ChannelTools(AbstractHarnessPlugin):
         limit: Annotated[int, Field(ge=1, le=20)] = 10,
         message_id: Annotated[str, Field(min_length=1, max_length=1024)] | None = None,
     ) -> list[dict]:
-        """Read recent incoming text messages in the conversation that triggered this run, newest first."""
+        """Read recent incoming messages and attachment metadata in the source conversation, newest first."""
         active, account, job = await self.source(ctx, message_id)
         return await read_messages(active.store, account, job["kind"], job["conversation_id"], limit)
+
+    async def channel_view_attachment(
+        self,
+        ctx: RunContext[AgentContext],
+        index: AttachmentIndex,
+        message_id: MessageId,
+        source_message_id: MessageId | None = None,
+        save_path: EnvironmentPath | None = None,
+    ) -> ToolReturn | dict:
+        """View a QQ image or sticker, or save an attachment. Pass source_message_id to open an older message."""
+        active, account, job = await self.source(ctx, source_message_id or message_id)
+        return await read_qq_attachment(
+            ctx,
+            active.store,
+            account,
+            job["kind"],
+            job["conversation_id"],
+            message_id,
+            index,
+            save_path,
+        )
+
+    async def channel_get_message(
+        self,
+        ctx: RunContext[AgentContext],
+        message_id: MessageId,
+        source_message_id: MessageId | None = None,
+    ) -> dict:
+        """Read a full stored message. To read older history, identify this run's source with source_message_id."""
+        active, account, job = await self.source(ctx, source_message_id or message_id)
+        payload = await history_message(active.store, account, job["kind"], job["conversation_id"], message_id)
+        return ChannelMessage.model_validate(payload).model_dump()
 
     async def channel_send_message(
         self,
         ctx: RunContext[AgentContext],
-        text: ReplyText,
-        message_id: Annotated[str, Field(min_length=1, max_length=1024)] | None = None,
+        text: ReplyText | None = None,
+        message_id: MessageId | None = None,
+        rich: QQRichContent | None = None,
+        reference_message_id: MessageId | None = None,
     ) -> dict:
-        """Send a text reply to the chat that triggered this run. Only call this when you want the chat to see it."""
+        """Reply to the source chat. QQ supports media, Markdown, and cards. Quote a message with reference_message_id."""
         active, account, job = await self.source(ctx, message_id)
         if ctx.tool_call_id is None:
             raise ModelRetry("A recorded tool call is required to send a message.")
+        if account["platform"] != "qq" and (rich is not None or reference_message_id is not None):
+            raise ModelRetry("This channel supports text replies.")
+        if text is None and rich is None:
+            raise ModelRetry("Supply text or rich content.")
+        recorded = (
+            text
+            if rich is None and reference_message_id is None
+            else sha256(
+                json.dumps(
+                    [text, rich.model_dump(mode="json") if rich else None, reference_message_id],
+                    sort_keys=True,
+                ).encode()
+            ).hexdigest()
+        )
         call_id = sha256(ctx.tool_call_id.encode()).hexdigest()
         claimed = await active.store.query(
             """INSERT OR IGNORE INTO channel_sends (delivery_id, call_id, text, status)
                SELECT id, ?, ?, 'sending' FROM channel_deliveries
                WHERE id = ? AND status IN ('queued', 'submitted') RETURNING status""",
             call_id,
-            text,
+            recorded,
             job["id"],
         )
         if not claimed:
@@ -394,13 +601,41 @@ class ChannelTools(AbstractHarnessPlugin):
             if not existing:
                 raise ModelRetry("The channel delivery is no longer active.")
             previous = existing[0]
-            if previous["text"] != text:
+            if previous["text"] != recorded:
                 raise ModelRetry("The tool call ID was already used for a different reply.")
             if previous["status"] == "sent":
                 return {"status": "sent", "message_id": previous["message_id"]}
             return {"status": previous["status"], "message": "This send was already attempted. Do not repeat it."}
         try:
-            sent = await active.send_reply(account, job["message_id"], text)
+            data = await prepare_qq_send(ctx, job["kind"], text, rich)
+            if data is not None:
+                _, account, _ = await self.source(ctx, job["message_id"])
+            reference_id = None
+            if reference_message_id is not None:
+                quoted = await history_message(
+                    active.store, account, job["kind"], job["conversation_id"], reference_message_id
+                )
+                reference_id = quoted.get("structured", {}).get("native_reference_id")
+                if not reference_id:
+                    if job["kind"] in {"private", "group"}:
+                        raise ModelRetry(
+                            "QQ did not supply a native quote identifier for that message. Use a normal reply."
+                        )
+                    reference_id = reference_message_id
+        except ModelRetry:
+            await active.store.query(
+                "DELETE FROM channel_sends WHERE delivery_id = ? AND call_id = ? AND status = 'sending'",
+                job["id"],
+                call_id,
+            )
+            raise
+        try:
+            if rich is None and reference_id is None:
+                sent = await active.send_reply(account, job["message_id"], text)
+            else:
+                sent = await active.send_reply(
+                    account, job["message_id"], text, rich=rich, data=data, reference_id=reference_id
+                )
         except ServiceError as error:
             status = "unknown" if error.code == "unavailable" else "failed"
             await active.store.query(

@@ -35,7 +35,17 @@ from a13n_channels.accounts import Accounts
 from a13n_channels.delivery import Deliveries
 from a13n_channels.github import GITHUB_KINDS, GitHubBind, GitHubConnection, GitHubPlatform, stamp
 from a13n_channels.messages import ChannelMessage, TextReply
-from a13n_channels.qq import QQ_CONVERSATION_KINDS, AppId, ChannelId, QQAccount, QQConnection, QQCreate, QQSecret
+from a13n_channels.qq import (
+    QQ_CONVERSATION_KINDS,
+    AppId,
+    ChannelId,
+    QQAccount,
+    QQConnection,
+    QQCreate,
+    QQRejected,
+    QQSecret,
+)
+from a13n_channels.qq_content import QQReply, QQRichContent, validate_rich
 from a13n_channels.qq_pairing import LoginId, QQScan, QQScanCredentials, QQScans, QQScanSave, QQScanStatus
 from a13n_channels.routing import RouteInput
 from a13n_channels.tools import DELIVERY_FACTORY_KEY, FACTORY_KEY, ChannelToolFactory
@@ -188,8 +198,8 @@ class ChannelsRuntime:
         if row["platform"] == "qq":
             qq = QQConnection(self.http, channel_id, self.store.credentials(row))
 
-            async def receive(message: ChannelMessage) -> None:
-                await self.store.receive(message, row["generation"])
+            async def receive(message: ChannelMessage) -> bool:
+                return await self.store.receive(message, row["generation"])
 
             work = qq.listen(receive, status)
         elif row["platform"] == "weixin":
@@ -214,7 +224,16 @@ class ChannelsRuntime:
         status("connecting")
         return self.host.tasks.start(work, name=f"channels-{channel_id}")
 
-    async def send_reply(self, account: sqlite3.Row, message_id: str, text: str) -> str:
+    async def send_reply(
+        self,
+        account: sqlite3.Row,
+        message_id: str,
+        text: str | None,
+        *,
+        rich: QQRichContent | None = None,
+        data: bytes | None = None,
+        reference_id: str | None = None,
+    ) -> str:
         channel_id = account["id"]
         if account["platform"] == "qq":
             credentials = self.store.credentials(account)
@@ -227,19 +246,42 @@ class ChannelsRuntime:
             )
             if not source:
                 raise not_found("qq_message", message_id)
-            incoming = ChannelMessage.model_validate_json(source[0]["payload"])
+            stored = json.loads(source[0]["payload"])
+            incoming = ChannelMessage.model_validate(stored)
+            event_reply_id = None
+            if stored.get("qq_context"):
+                context = self.store.qq_message_context(account, message_id, stored["qq_context"])
+                event_reply_id = context["event_reply_id"]
+            connection = QQConnection(self.http, channel_id, credentials)
             try:
-                return await QQConnection(self.http, channel_id, credentials).reply(
-                    incoming, text, source[0]["reply_sequence"]
+                validate_rich(incoming.kind, text, rich)
+            except ValueError as error:
+                raise ServiceError("invalid_argument", str(error)) from None
+            try:
+                if rich is None and reference_id is None and event_reply_id is None:
+                    return await connection.reply(incoming, text, source[0]["reply_sequence"])
+                return await connection.reply(
+                    incoming,
+                    text,
+                    source[0]["reply_sequence"],
+                    rich=rich,
+                    data=data,
+                    reference_id=reference_id,
+                    event_reply_id=event_reply_id,
                 )
             except httpx.HTTPStatusError as error:
-                if error.response.status_code < 500:
+                if 400 <= error.response.status_code < 500 and error.response.status_code != 408:
                     raise ServiceError(
                         "invalid_argument", "QQ rejected the reply. Check message expiry and bot permissions."
                     ) from None
                 raise ServiceError("unavailable", "QQ did not confirm the reply.") from None
+            except QQRejected as error:
+                raise ServiceError("invalid_argument", str(error)) from None
             except (httpx.HTTPError, ValueError, KeyError, TypeError):
                 raise ServiceError("unavailable", "QQ did not confirm the reply.") from None
+
+        if text is None or rich is not None or reference_id is not None:
+            raise ServiceError("invalid_argument", "This channel supports text replies.")
 
         if account["platform"] in {"github", "github_app"}:
             rows = await self.store.query(
@@ -851,7 +893,7 @@ def definition() -> AppDefinition:
     @router.post("/qq/accounts/{channel_id}/reply", name="reply_to_qq_message")
     async def reply(
         channel_id: ChannelId,
-        body: TextReply,
+        body: QQReply,
         runtime: CurrentRuntime,
         actor: Actor,
         workspace_id: WorkspaceId,
@@ -867,7 +909,7 @@ def definition() -> AppDefinition:
         )
         if not rows:
             raise not_found("qq_channel", channel_id)
-        return {"message_id": await active.send_reply(rows[0], message_id, body.text)}
+        return {"message_id": await active.send_reply(rows[0], message_id, body.text, rich=body.rich)}
 
     async def weixin_account(active: ChannelsRuntime, channel_id: str, workspace_id: str) -> sqlite3.Row:
         rows = await active.store.query(
