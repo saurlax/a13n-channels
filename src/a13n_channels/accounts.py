@@ -1,0 +1,292 @@
+"""App-owned accounts, encrypted credentials, and received channel messages."""
+
+import asyncio
+import sqlite3
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
+from pathlib import Path
+
+from a13n_service.infra.crypto import Envelope, KeyRing, SecretLocation
+from a13n_service.infra.errors import ServiceError, not_found
+from a13n_service.infra.ids import new_object_id
+
+from a13n_channels.messages import ChannelMessage
+from a13n_channels.qq import QQCreate, QQSecret
+from a13n_channels.routing import SCHEMA, Route, RouteInput, enqueue, read_routes, validate_route
+from a13n_channels.weixin import WeixinCredentials
+
+
+class Accounts:
+    def __init__(self, path: Path, keys: KeyRing):
+        self.path = path
+        self.keys = keys
+
+    async def initialize(self) -> None:
+        await asyncio.to_thread(self._initialize)
+
+    def _initialize(self) -> None:
+        self.path.touch(mode=0o600, exist_ok=True)
+        with closing(sqlite3.connect(self.path)) as db:
+            db.executescript("""
+                CREATE TABLE IF NOT EXISTS qq_accounts (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    workspace_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    app_id TEXT NOT NULL UNIQUE,
+                    app_secret TEXT NOT NULL,
+                    intents INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS weixin_accounts (
+                    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, workspace_id TEXT NOT NULL,
+                    name TEXT NOT NULL, bot_id TEXT UNIQUE, credentials TEXT, cursor TEXT NOT NULL DEFAULT ''
+                );
+            """)
+            db.executescript(SCHEMA)
+            with db:
+                db.execute("BEGIN IMMEDIATE")
+                if not any(row[1] == "principal_id" for row in db.execute("PRAGMA table_info(channel_routes)")):
+                    db.execute("ALTER TABLE channel_routes ADD COLUMN principal_id TEXT")
+                if not any(row[1] == "destination" for row in db.execute("PRAGMA table_info(channel_deliveries)")):
+                    db.execute("ALTER TABLE channel_deliveries ADD COLUMN destination TEXT NOT NULL DEFAULT ''")
+                    db.execute("""UPDATE channel_deliveries SET destination =
+                        json_array('conversation', channel_id, account_id, kind, conversation_id)""")
+                if not any(row[1] == "tool_key" for row in db.execute("PRAGMA table_info(channel_deliveries)")):
+                    db.execute("ALTER TABLE channel_deliveries ADD COLUMN tool_key TEXT")
+                    db.execute("ALTER TABLE channel_deliveries ADD COLUMN tool_request TEXT")
+                db.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS channel_delivery_tool_key ON channel_deliveries(tool_key)"
+                )
+                db.execute("""CREATE INDEX IF NOT EXISTS channel_delivery_destination
+                    ON channel_deliveries (destination, status)""")
+                self._message_store(db, "qq", "app_id", "reply_sequence INTEGER NOT NULL DEFAULT 0", "reply_sequence")
+                self._message_store(db, "weixin", "bot_id", "context TEXT", "context")
+
+    @staticmethod
+    def _message_store(db: sqlite3.Connection, platform: str, identity: str, column: str, value: str) -> None:
+        table = f"{platform}_messages"
+        accounts = f"{platform}_accounts"
+        fields = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+        if "account_id" in fields:
+            return
+        if fields:
+            db.execute(f"ALTER TABLE {table} RENAME TO {table}_previous")
+        db.execute(f"""
+            CREATE TABLE {table} (
+                channel_id TEXT NOT NULL REFERENCES {accounts}(id) ON DELETE CASCADE,
+                account_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                {column},
+                PRIMARY KEY (channel_id, account_id, message_id)
+            )
+        """)
+        if fields:
+            db.execute(f"""
+                INSERT INTO {table}
+                SELECT previous.channel_id, account.{identity}, previous.message_id, previous.payload, previous.{value}
+                FROM {table}_previous AS previous JOIN {accounts} AS account ON account.id = previous.channel_id
+                ORDER BY previous.rowid
+            """)
+            db.execute(f"DROP TABLE {table}_previous")
+
+    async def query(self, sql: str, *args: object) -> list[sqlite3.Row]:
+        return await asyncio.to_thread(self._query, sql, args)
+
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys = ON")
+            yield db
+
+    def _query(self, sql: str, args: tuple[object, ...]) -> list[sqlite3.Row]:
+        with self.transaction() as db:
+            return db.execute(sql, args).fetchall()
+
+    async def routes(self, workspace_id: str) -> list[Route]:
+        def load() -> list[Route]:
+            with self.transaction() as db:
+                return read_routes(db, workspace_id)
+
+        return await asyncio.to_thread(load)
+
+    async def save_route(
+        self, workspace_id: str, route_id: str, body: RouteInput, *, principal_id: str, create: bool
+    ) -> Route:
+        return await asyncio.to_thread(self._save_route, workspace_id, route_id, body, principal_id, create)
+
+    def _save_route(self, workspace_id: str, route_id: str, body: RouteInput, principal_id: str, create: bool) -> Route:
+        with self.transaction() as db:
+            db.execute("BEGIN IMMEDIATE")
+            routes = read_routes(db, workspace_id)
+            previous = next((route for route in routes if route.id == route_id), None)
+            if not create and previous is None:
+                raise not_found("channel_route", route_id)
+            validate_route(body, routes, route_id)
+            for source in body.sources:
+                if (
+                    source.channel_id != "*"
+                    and not db.execute(
+                        """SELECT id FROM qq_accounts WHERE id = ? AND workspace_id = ?
+                       UNION ALL SELECT id FROM weixin_accounts WHERE id = ? AND workspace_id = ?""",
+                        (source.channel_id, workspace_id, source.channel_id, workspace_id),
+                    ).fetchone()
+                ):
+                    raise ServiceError("invalid_argument", "Choose a channel in this workspace.")
+            destination_changed = previous is not None and (
+                previous.thread_policy != body.thread_policy or previous.fixed_thread_id != body.fixed_thread_id
+            )
+            if (
+                destination_changed
+                and db.execute(
+                    """SELECT 1 FROM channel_deliveries WHERE route_id = ?
+                   AND status IN ('wake_queued', 'wake_submitted', 'queued', 'submitted', 'sending') LIMIT 1""",
+                    (route_id,),
+                ).fetchone()
+            ):
+                raise ServiceError(
+                    "conflict",
+                    "Wait for route deliveries to finish before changing the Thread destination.",
+                    {"reason": "thread_destination_busy"},
+                )
+            binding_id = (
+                previous.binding_id
+                if previous
+                and not destination_changed
+                and previous.agent_id == body.agent_id
+                and previous.principal_id == principal_id
+                else new_object_id("chbind")
+            )
+            route = Route(**body.model_dump(), id=route_id, binding_id=binding_id, principal_id=principal_id)
+            db.execute(
+                """INSERT INTO channel_routes VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET name=excluded.name, agent_id=excluded.agent_id,
+                   enabled=excluded.enabled, sources=excluded.sources, binding_id=excluded.binding_id,
+                   principal_id=excluded.principal_id""",
+                (
+                    route_id,
+                    workspace_id,
+                    route.name,
+                    route.agent_id,
+                    route.enabled,
+                    route.model_dump_json(
+                        include={"sources", "thread_policy", "fixed_thread_id", "multiparty_messages", "wake_agent_id"}
+                    ),
+                    binding_id,
+                    principal_id,
+                ),
+            )
+            if previous and (not route.enabled or binding_id != previous.binding_id):
+                self._stop_deliveries(db, route_id)
+                if binding_id != previous.binding_id:
+                    db.execute("DELETE FROM channel_threads WHERE binding_id = ?", (previous.binding_id,))
+            elif previous and previous.wake_agent_id != route.wake_agent_id:
+                db.execute(
+                    """UPDATE channel_deliveries SET status = 'stopped'
+                       WHERE route_id = ? AND status IN ('wake_queued', 'wake_submitted')""",
+                    (route_id,),
+                )
+            return route
+
+    async def delete_route(self, workspace_id: str, route_id: str) -> None:
+        def delete() -> None:
+            with self.transaction() as db:
+                row = db.execute(
+                    "DELETE FROM channel_routes WHERE workspace_id = ? AND id = ? RETURNING binding_id",
+                    (workspace_id, route_id),
+                ).fetchone()
+                if row is None:
+                    raise not_found("channel_route", route_id)
+                self._stop_deliveries(db, route_id)
+                db.execute("DELETE FROM channel_threads WHERE binding_id = ?", (row["binding_id"],))
+
+        await asyncio.to_thread(delete)
+
+    @staticmethod
+    def _stop_deliveries(db: sqlite3.Connection, route_id: str) -> None:
+        db.execute(
+            """UPDATE channel_deliveries SET status = 'stopped'
+               WHERE route_id = ? AND status IN ('wake_queued', 'wake_submitted', 'queued', 'submitted')""",
+            (route_id,),
+        )
+
+    @staticmethod
+    def location(organization_id: str, channel_id: str) -> SecretLocation:
+        return SecretLocation(organization_id, "channels.qq_accounts", "app_secret", channel_id)
+
+    def encrypt(self, organization_id: str, channel_id: str, secret: QQSecret) -> str:
+        return self.keys.protect(
+            secret.app_secret.get_secret_value().encode(), self.location(organization_id, channel_id)
+        ).model_dump_json()
+
+    def credentials(self, account: sqlite3.Row) -> QQCreate:
+        secret = self.keys.reveal(
+            Envelope.model_validate_json(account["app_secret"]),
+            self.location(account["organization_id"], account["id"]),
+        )
+        return QQCreate(
+            name=account["name"], app_id=account["app_id"], app_secret=secret.decode(), qq_intents=account["intents"]
+        )
+
+    async def receive(self, incoming: ChannelMessage, generation: str) -> None:
+        await asyncio.to_thread(self._receive_qq, incoming, generation)
+
+    def _receive_qq(self, incoming: ChannelMessage, generation: str) -> None:
+        with self.transaction() as db:
+            row = db.execute(
+                """INSERT OR IGNORE INTO qq_messages (channel_id, account_id, message_id, payload)
+                   SELECT id, app_id, ?, ? FROM qq_accounts WHERE id = ? AND app_secret = ?
+                   RETURNING account_id""",
+                (incoming.id, incoming.model_dump_json(), incoming.channel_id, generation),
+            ).fetchone()
+            if row:
+                workspace = db.execute("SELECT workspace_id FROM qq_accounts WHERE id = ?", (incoming.channel_id,))
+                enqueue(db, workspace.fetchone()["workspace_id"], row["account_id"], incoming)
+
+    def seal(self, organization_id: str, table: str, column: str, row_id: str, value: bytes) -> str:
+        return self.keys.protect(value, SecretLocation(organization_id, table, column, row_id)).model_dump_json()
+
+    def unseal(self, organization_id: str, table: str, column: str, row_id: str, value: str) -> bytes:
+        return self.keys.reveal(
+            Envelope.model_validate_json(value), SecretLocation(organization_id, table, column, row_id)
+        )
+
+    def weixin_credentials(self, row: sqlite3.Row) -> WeixinCredentials:
+        value = self.unseal(
+            row["organization_id"], "channels.weixin_accounts", "credentials", row["id"], row["credentials"]
+        )
+        return WeixinCredentials.model_validate_json(value)
+
+    async def receive_weixin(
+        self, account: sqlite3.Row, cursor: str, messages: list[tuple[ChannelMessage, str]]
+    ) -> None:
+        await asyncio.to_thread(self._receive_weixin, account, cursor, messages)
+
+    def _receive_weixin(self, account: sqlite3.Row, cursor: str, messages: list[tuple[ChannelMessage, str]]) -> None:
+        channel_id = account["id"]
+        with self.transaction() as db:
+            changed = db.execute(
+                "UPDATE weixin_accounts SET cursor = ? WHERE id = ? AND credentials = ?",
+                (cursor, channel_id, account["credentials"]),
+            ).rowcount
+            if not changed:
+                return
+            for message, context in messages:
+                stored = (
+                    self.seal(
+                        account["organization_id"],
+                        "channels.weixin_messages",
+                        "context",
+                        f"{channel_id}:{message.id}",
+                        context.encode(),
+                    )
+                    if context
+                    else None
+                )
+                inserted = db.execute(
+                    "INSERT OR IGNORE INTO weixin_messages VALUES (?, ?, ?, ?, ?)",
+                    (channel_id, account["app_id"], message.id, message.model_dump_json(), stored),
+                ).rowcount
+                if inserted:
+                    enqueue(db, account["workspace_id"], account["app_id"], message)

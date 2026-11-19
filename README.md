@@ -1,6 +1,6 @@
 # Channels
 
-An a13n Service App for managing channel accounts and routes in Console. The current scaffold installs a Channels page and a workspace-scoped summary endpoint. Channel Gateway integration is planned. The Python API and host-mounted frontend ship together in one wheel.
+An a13n Service App for managing QQ bots and Weixin ClawBot in Console. The App connects to QQ by outbound WebSocket and Weixin by iLink long polling. It stores received text messages and sends replies through the source channel.
 
 ## Prerequisites and compatibility
 
@@ -28,64 +28,93 @@ The GitHub Actions workflow runs these build/test steps on pushes and pull reque
 
 ## Open the App in Console
 
-1. Prepare and start a Service checkout at `.service-ref` using its [local development guide](https://github.com/converge-ai-labs/agent-foundation/blob/eb45177c00b2ce6e0d6be7e77e03a052433333ff/dev/service/README.md). Use `make dev-status` in that checkout to discover its URL.
+1. Prepare and start a Service checkout at `.service-ref` using its [local development guide](https://github.com/converge-ai-labs/agent-foundation/blob/2746cecd6c920ee683bc545f6c63df46285dd6c8/dev/service/README.md). Use `make dev-status` in that checkout to discover its URL.
 2. Install this plugin into that checkout's Service environment with `make install HOST_PYTHON=/absolute/path/to/host/.venv/bin/python`.
-3. Restart Service using that prepared environment. For the source development launcher, run `PATH="$PWD/.venv/bin:$PATH" make dev TRACES=none` from the host checkout so dependency synchronization does not remove the additional plugin.
+3. Add the Channels settings described below and restart Service with the same environment and settings file. The upstream checkout launcher writes a fresh `var/dev/service.toml` on `make dev`; keep the App section in the configuration you pass to Service.
 4. In Console, open **Settings → Organization → App plugins**, enable this App, and then open it under **Apps** in a workspace. Its route is `/workspace/{workspaceId}/apps/saurlax.channels/overview`.
 
-For live frontend development, install this project editable into the prepared host environment with `uv pip install --python /path/to/host/.venv/bin/python --no-deps -e .`, run `make dev` here, and reload the App page after each build. `make dev` emits the real host-mounted bundle; it does not run a separate React application. Restart Service after Python changes, installation or upgrades. Increment the version in `pyproject.toml` when changing shipped frontend bytes: Service versions its frontend URLs by the installed distribution version. The Makefile selects the wheel using the current manifest version even when older artifacts remain in `dist/`.
+For live frontend development, install this project editable into the prepared host environment with `uv pip install --python /path/to/host/.venv/bin/python -e .`, run `make dev` here, and reload the App page after each build. `make dev` emits the real host-mounted bundle; it does not run a separate React application. Restart Service after Python changes, installation or upgrades. Increment the version in `pyproject.toml` when changing shipped frontend bytes: Service versions its frontend URLs by the installed distribution version. The Makefile selects the wheel using the current manifest version even when older artifacts remain in `dist/`.
+
+## Configure channels
+
+Run one Service process in the `all` role for this App's current storage and listener model. Set its state path in the Service settings file and use a persistent volume. Configure the host Service encryption key to protect bot credentials and Weixin reply contexts.
+
+```toml
+[channels]
+state_path = "/var/lib/a13n-channels/channels.sqlite3"
+```
+
+`A13N_CHANNELS__STATE_PATH` can also set the path. The App stores workspace-owned accounts and received messages in SQLite. Keep the database directory and host encryption key across restarts. The lock beside the database ensures one Service process owns its listeners.
+
+In Console, enable **Channels** for the organization and open **Apps → Channels** in a workspace. Choose **Add channel** and enter the QQ bot's name, AppID, and AppSecret. The App connects to QQ using its outbound Gateway protocol. The account list refreshes connection state. Open the channel row to edit its credentials or delete it. The type and name are fixed. QQ credentials can be replaced by scan or entered manually. Replacing an AppID requires its matching AppSecret.
+
+### QQ QR binding
+
+Install Tencent's connector in the Service runtime alongside Node.js 18 or later. The App uses the connector's default third-party identity on the authorization screen.
+
+```bash
+npm install --prefix /opt/a13n/qq-connector --ignore-scripts @tencent-connect/qqbot-connector@1.2.0
+```
+
+Add `qq_connector_path = "/opt/a13n/qq-connector/node_modules/@tencent-connect/qqbot-connector"` to the existing `[channels]` settings section and restart Service. If the connector must use the deployment's HTTPS proxy, set `NODE_USE_ENV_PROXY=1` in the Service process environment on a Node version that supports it.
+
+With the connector configured, select **Scan QR code** under **QQ Bot** and approve the binding in the QQ mobile app. The current dialog displays the QR code and confirms authorization after approval. After authorization, Channels automatically opens a temporary QQ WebSocket and waits for the platform to report readiness. Use **Test connection** to retry or to check manually entered credentials. Click **Save** to add the channel. Service saves the returned credentials in the workspace using the same encrypted storage as manual setup. Select **Enter credentials** to add a bot manually. Deployments without the connector can continue using manual setup.
+
+### Weixin pairing
+
+For Weixin, choose **Weixin ClawBot** in **Add channel**. Enter a name, get the QR code, then scan and confirm it in Weixin. Enter the verification code if prompted. Open the channel row to pair again. Click **Save** after approving the QR code in Weixin. Weixin supports private text messages and replies to messages with an active reply context.
+
+The Console page manages accounts and their connection status. To remove a QQ or Weixin channel, open its row and choose **Delete** in the editor footer. Confirming stops the connection and permanently deletes the channel and its locally stored messages, including messages from previous bot bindings. When a channel is paired with a different bot, incoming messages and replies use the new bot's identity. Earlier records stay associated with the previous bot. The App API supports receiving and replying to text messages, scoped to their source conversation. Disabling the App for an organization stops its connections and retains its stored accounts and messages.
+
+## Route messages to Agents
+
+1. Enable **Channels** under **Settings → Organization → App plugins**.
+2. Open **Apps → Channels** in the workspace and bind a QQ Bot or Weixin ClawBot.
+3. Open **Delivery routes → Add route**, choose a published Agent and the message sources, then save the route with **Enable route** selected.
+
+New matching messages trigger the target Agent. Channels loads the conversation tools automatically for each routed run. This workflow requires no changes in the Agent editor.
+
+Each source selects an account or all accounts, a conversation type or all types, and optionally one or more exact conversation IDs. Select an observed ID or enter it directly. Leave the conversation field empty to match every conversation of the selected type. Start with specific sources when only particular chats should be able to run the Agent.
+
+Under **Filters**, choose whether group and guild messages must mention the bot or whether all received messages qualify. This applies across the route's sources. Private messages always pass this filter. New routes in Console default to mentions only. Older routes retain their saved behavior until a route-wide filter is selected. Ordinary group messages require QQ's receive-all-messages setting, and guild channels require the corresponding QQ permissions. A filtered message never falls through to a broader route.
+
+Choose a different published **Wake Agent** to decide whether a qualifying message reaches the target Agent. Configure the decision criteria in the wake Agent's instructions. Each decision runs in a separate Thread and returns a boolean. A positive decision delivers the original message to the target Agent under its configured Thread policy. A negative decision skips delivery. A failed decision appears in route status.
+
+A specific conversation wins over a wildcard conversation. The next tie-breakers are a specific account and a specific conversation type. Saving equally specific overlaps is rejected. A paused matching rule prevents fallback to a more general rule. Messages with no enabled matching rule stay in channel storage. Creating or enabling a route does not replay them.
+
+Saving authorizes the route to submit inputs under the saving user's identity. The plugin loads that person's current workspace grants for each delivery and uses only the read and run verbs. Losing either grant pauses delivery. Saving as a different user starts fresh Threads. Routes created by the previous HTTP-based implementation require one save to authorize in-process delivery. Remove its delivery URL and Runner key settings when upgrading.
+
+Each matched text message is submitted as ordinary user input with source metadata. The route selects one of four Thread policies:
+
+| Policy | Thread scope |
+| --- | --- |
+| Reuse by conversation (default) | One Thread per channel account and conversation. |
+| Reuse by sender | One Thread per sender within each channel account and conversation. |
+| Reuse one Thread | All sources share an existing Thread in the workspace, or a Thread created on first delivery when the ID is empty. |
+| New Thread for each message | A separate Session and Thread for every message. |
+
+A new target Agent or saving user resets the route's managed Thread bindings. An explicit fixed Thread ID continues to target that Thread. Changing the Thread destination requires pending deliveries to settle.
+
+The plugin submits directly through the host Service and uses the same idempotency key when retrying an uncertain submission.
+
+Channel delivery adds two Harness tools to the target Agent for that run:
+
+- `channel_list_messages` reads recent incoming text from the originating conversation.
+- `channel_send_message` sends a text reply of up to 2,000 characters to the originating conversation. QQ and Weixin use the original message's reply context.
+
+Assistant text stays in Console. A channel reply requires a send tool call. The tools resolve the conversation from the run's delivery record and require a currently enabled route and account. They are available to the target Agent during channel delivery. Failed deliveries and unconfirmed sends appear in route status. A replay of the same send call never resends an unconfirmed reply.
+
+### Proposed Agent read access
+
+The proposed workflow for reading channel history from ordinary Console conversations is to add **Channels** under **Advanced → Plugins** in the Agent editor and configure **Allowed channels**. An empty selection would allow reads from all channel accounts in the current workspace. Selecting accounts would limit reads to those accounts.
+
+This setting is planned. The current tools require a channel-triggered run and scope both reading and sending to its originating conversation.
 
 ## Where to make changes
 
-- `src/a13n_channels/app.py`: App definition and `GET /summary`. The host owns authentication, organization activation and initial workspace admission. Add explicit workspace write authorization before any business mutation.
-- `frontend/src/index.tsx`: the overview page. `useApp().request()` scopes requests to `/api/v1/apps/saurlax.channels/`; `queryKey()` scopes caches to the App and current organization/workspace.
-- `frontend/src/app.css`: styles scoped to `.a13n-channels-overview`. Use host design tokens; App CSS shares the document.
-- `pyproject.toml`: entry point and asset packaging. Both wheel and sdist include the built frontend; rebuilding a wheel from the sdist needs no Node.js.
-- `tests/test_installed_app.py`: installed distribution discovery, assets and the example handler. Host authentication and activation are Service's integration-test responsibility.
-
-The App is trusted installed code. It uses the host React tree, not its own root or providers, and does not override workspace home. See the [App authoring guide](https://github.com/converge-ai-labs/agent-foundation/blob/eb45177c00b2ce6e0d6be7e77e03a052433333ff/docs/a13n-service/app-plugins.md) for settings, business tools and lifecycle APIs.
-
-## Add persistence when needed
-
-The generated project has no database declaration, models or migration scaffold. Add them only when your App needs durable business data. First update `.service-ref` to a compatible Service revision that includes `a13n_service.app_database.AppDatabase` and `apps db` commands, then run `make setup HOST_SOURCE=/absolute/path/to/checkout-at-new-ref` using a checkout whose HEAD matches the new pin. Updating `.service-ref` alone does not update an existing `.host/agent-foundation` checkout. The default template pin predates this optional SDK. See the [App persistence guide](https://github.com/converge-ai-labs/agent-foundation/blob/main/docs/a13n-service/app-plugins.md#persist-business-data) for the complete model, packaging and test workflow.
-
-Declare an `AppDatabase` and ordinary SQLAlchemy models in `models.py`, use its `metadata` on your declarative base, then import the module from `app.py` and pass the same database to `AppDefinition(database=database)`. Resolve deployment configuration before model imports:
-
-```python
-import os
-
-from a13n_service.app_database import AppDatabase
-from sqlalchemy.orm import DeclarativeBase
-
-database = AppDatabase(
-    "saurlax.channels",
-    migrations="a13n_channels:migrations",
-    prefix=os.environ.get("A13N_CHANNELS_TABLE_PREFIX") or None,
-)
-
-
-class Base(DeclarativeBase):
-    metadata = database.metadata
-
-# On each owned model: __tablename__ = database.name("notes")
-```
-
-The optional prefix label can be selected at deployment before model imports. Leave it unset for a deterministic readable slug plus digest of the full exact App ID. IDs differing only in separators get different defaults; long IDs work without an override. Use `database.name(...)` rather than hardcoding names. A label is lowercase snake case, starts with a letter and fits 24 bytes; the physical namespace is `app__{label}__` in PostgreSQL `public`. Configure the same value in migration, control and worker processes for a deployment. Authoring may use the default because generated identifiers are portable. A retained App ID/prefix binding prevents changing an initialized deployment's identity: a different setting does not rename or move existing data.
-
-From this project root, after adding the declaration and models:
-
-```bash
-uv run --no-sync a13n-service apps db init --app saurlax.channels
-uv run --no-sync a13n-service apps db revision --app saurlax.channels -m "create business tables" \
-  --scratch-url "$APP_TEST_POSTGRES_URL"
-uv run --no-sync a13n-service apps db check --app saurlax.channels \
-  --scratch-url "$APP_TEST_POSTGRES_URL"
-```
-
-Use a local/CI PostgreSQL server whose role can create and drop temporary databases. Generation and checks replay Core plus this App in a new disposable database and leave the configured business database unchanged. Review the generated Alembic draft for locks, data changes, downgrade and rolling compatibility. Owned generated identifiers use `migration_name(...)` so one packaged history works with deployment-selected prefixes; raw SQL and expression text need explicit portable names and review. This template's existing `src` package configuration already includes Python migration resources. Verify the built wheel with `make verify` followed by `apps db check`. For persistence CI, add a PostgreSQL service with `CREATE DATABASE` permission and run that parity check; the generated build workflow does not provision PostgreSQL.
-
-App rows use the host's `transaction(runtime.storage)` and `short_session(runtime.storage)` scopes. Native ORM rows can participate in the same session and joins. Use `database.reference(NativeRow.__table__)` for read-only native foreign-key targets, and keep App migrations confined to their own prefix. Reuse `a13n_service.migrations.scratch.scratch_database` for tests that replay Core and the App's packaged history; close Storage before the temporary database scope ends.
-
-For deployment, install the App wheel consistently. By default, `all` and `control` startup migrate Core and every installed App database, even for organization-disabled Apps. Set `A13N_DATABASE__AUTO_MIGRATE_APPS=false` to manage App upgrades separately, or `A13N_DATABASE__AUTO_MIGRATE=false` to disable all startup migration and run `a13n-service migrate` in a dedicated job. Plain `migrate` includes installed Apps; `--no-apps` selects Core only. `migrate --check` checks live schema parity without creating a database. Use `a13n-service apps db status --app saurlax.channels` to inspect applied and packaged heads, or `apps db upgrade --app saurlax.channels` to apply only this App after Core is current. Startup validates every installed App database before callbacks. Workers, readiness and organization enablement never run DDL. Uninstalling the package retains its namespace and data.
+- `src/a13n_channels/app.py` registers the workspace account and routing APIs. `routing.py` matches sources, `delivery.py` submits inputs, and `tools.py` implements the conversation tools.
+- `src/a13n_channels/qq.py` implements QQ authentication, WebSocket handling, and passive replies. `src/a13n_channels/accounts.py` owns account and message storage.
+- `frontend/src/index.tsx` mounts the Channels page in Console. App requests and cache keys are scoped by the host bridge.
+- `pyproject.toml` owns entry-point discovery and wheel/sdist asset packaging.
 
 See [AGENTS.md](AGENTS.md) for project boundaries and Conventional Commit guidance.

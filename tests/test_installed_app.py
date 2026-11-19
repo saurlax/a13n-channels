@@ -25,12 +25,11 @@ def test_entry_point_discovery_and_packaged_frontend():
     assert root.joinpath("index.css").read_text()
 
 
-def test_summary_uses_the_supplied_workspace():
+def test_qq_accounts_are_unconfigured_before_startup():
     installed = metadata.distribution("a13n-channels")
     entry = next(item for item in installed.entry_points if item.group == "a13n_service.app_plugins")
     app = entry.load()()
-    route = next(route for router in app.routers for route in router.routes if route.path.endswith("/summary"))
+    route = next(route for router in app.routers for route in router.routes if route.name == "list_qq_accounts")
     result = asyncio.run(route.endpoint(workspace_id="wsp_test"))
-    assert result.workspace_id == "wsp_test"
-    assert result.message == "Your App backend is connected."
-    assert route.openapi_extra["x-a13n-mcp"] is True
+    assert result.model_dump() == {"configured": False, "accounts": []}
+    assert route.path == "/api/v1/apps/saurlax.channels/qq/accounts"

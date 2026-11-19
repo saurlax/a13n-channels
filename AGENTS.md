@@ -1,6 +1,6 @@
 # a13n-channels repository guide
 
-a13n-channels adds a Channels tab to a13n Console for managing channel accounts and routes. Channel Gateway owns platform connections, message delivery, and its MCP tools. The initial App uses the existing Service extension surface. Reverse WebSocket ingress stays outside the initial scope.
+a13n-channels adds a Channels tab to a13n Console. The App owns channel accounts, outbound platform connections, and messages. Channel Gateway is a protocol reference. The initial App uses the existing Service extension surface. Reverse WebSocket ingress stays outside the initial scope.
 
 ## Sources and workflow
 
@@ -11,7 +11,7 @@ a13n-channels adds a Channels tab to a13n Console for managing channel accounts 
 ## Engineering boundaries
 
 - Keep the App ID `saurlax.channels` consistent across package discovery, the App definition, and its router.
-- Use `app_router()` for Service authentication, organization enablement, and initial workspace admission. Enforce the operation's workspace and resource permissions in the handler. Keep Gateway credentials server-side and scope access to the selected workspace. Preserve protocol authentication at the Gateway boundary.
+- Use `app_router()` for Service authentication, organization enablement, and initial workspace admission. Enforce the operation's workspace and resource permissions in the handler. Keep channel credentials encrypted on the Service host and scope accounts and messages to their workspace. Preserve platform authentication in each adapter.
 - Mount pages through `@a13n/console` and reuse its React tree, theme, translation, and request facilities. Use workspace-scoped query keys and scope CSS to the App. Follow the [Console design guidelines](https://github.com/converge-ai-labs/agent-foundation/blob/main/spec/frontend/console-design-guidelines.md) for interaction changes.
 - Keep code direct, cohesive, and grounded in current requirements. Give each rule one owner. Add abstractions, guards, fallbacks, and retries when supported inputs, established boundaries, or concrete failure paths justify them. Preserve necessary correctness and security protections. Fix failures at their owner and surface actionable errors.
 - Keep external I/O asynchronous. If persistence is needed, follow the host App database contract at the selected Service revision and keep transactions short. Make reversible decisions directly. Use a proof of concept when resolving an uncertainty would materially change the design or avoid costly rework.

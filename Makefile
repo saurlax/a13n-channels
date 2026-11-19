@@ -21,7 +21,7 @@ setup: host ## Prepare an isolated Python environment and locked frontend depend
 	uv pip install --python "$(PYTHON)" 'pytest>=8,<10' 'ruff>=0.11,<1'
 	pnpm --dir frontend install --frozen-lockfile
 	$(MAKE) frontend
-	uv pip install --python "$(PYTHON)" --no-deps -e .
+	uv pip install --python "$(PYTHON)" -e .
 
 frontend: ## Build the host-mounted ESM frontend into the Python package
 	pnpm --dir frontend build
@@ -45,4 +45,4 @@ dev: ## Rebuild frontend on changes; reload the App page after each build
 
 install: build ## Install wheel into an existing compatible host (HOST_PYTHON=/path/to/python)
 	@test -n "$(HOST_PYTHON)" || { echo 'Set HOST_PYTHON to the Service environment Python'; exit 1; }
-	uv pip install --python "$(HOST_PYTHON)" --no-deps --reinstall "$(WHEEL)"
+	uv pip install --python "$(HOST_PYTHON)" --reinstall-package a13n-channels "$(WHEEL)"
