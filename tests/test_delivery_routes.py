@@ -21,7 +21,7 @@ from a13n_channels.routing import RouteInput, Source, select_route
 def channel_input(message):
     (part,) = message.payload.content
     header, text = part.text.split("\n\nMessage:\n", 1)
-    return json.loads(header.removeprefix("Channel source: ")), text
+    return json.loads(header.splitlines()[0].removeprefix("Channel source: ")), text
 
 
 def store_for(tmp_path):
@@ -127,6 +127,8 @@ def incoming(message_id, conversation="user"):
 def test_matched_text_retries_same_submission_and_reuses_source_thread(
     platform, tmp_path, monkeypatch, published_agent
 ):
+    from a13n_channels.qq_content import QQInbound
+
     async def exercise():
         store = store_for(tmp_path)
         await store.initialize()
@@ -157,6 +159,15 @@ def test_matched_text_retries_same_submission_and_reuses_source_thread(
         )
         assert await store.query("SELECT * FROM channel_deliveries") == []
         first = incoming("first")
+        if platform == "qq":
+            first = QQInbound.model_validate(
+                {
+                    **first.model_dump(),
+                    "attachments": [{"kind": "image", "media_type": "image/png", "filename": "photo.png"}],
+                    "attachment_urls": ["https://qq.example.com/photo.png?rkey=private"],
+                    "structured": {"record": True},
+                }
+            )
         await receive(first)
         await receive(first)
         await receive(incoming("second"))
@@ -189,6 +200,10 @@ def test_matched_text_retries_same_submission_and_reuses_source_thread(
             metadata, text = channel_input(message)
             assert text == f"prompt-{metadata['message_id']}"
             identifier = metadata["message_id"]
+            if platform == "qq" and identifier == "first":
+                assert 'Channel attachments: [{"index": 1' in message.payload.content[0].text
+                assert 'Channel structure: {"record": true}' in message.payload.content[0].text
+                assert "rkey=private" not in message.payload.content[0].text
             invocation = (identifier, path, key, message)
             attempts.append(invocation)
             if key in posts:
@@ -440,9 +455,12 @@ def test_wake_filter_runs_before_the_main_agent(output, expected, tmp_path, monk
 
 
 def test_channel_tools_use_trusted_delivery_and_do_not_repeat_a_send(tmp_path, monkeypatch):
+    import httpx
+    from a13n_harness.configuration import RunConfiguration
     from pydantic_ai import ModelRetry
 
     from a13n_channels import tools
+    from a13n_channels.qq_content import QQInbound, QQMedia
 
     async def exercise():
         store = store_for(tmp_path)
@@ -458,7 +476,18 @@ def test_channel_tools_use_trusted_delivery_and_do_not_repeat_a_send(tmp_path, m
             principal_id="owner",
             create=True,
         )
-        await store.receive(incoming("source"), "credentials")
+        url = "https://qq.example.com/photo.png?rkey=private"
+        source_message = QQInbound.model_validate(
+            {
+                **incoming("source").model_dump(),
+                "attachments": [{"kind": "image", "media_type": "image/png", "filename": "photo.png"}],
+                "attachment_urls": [url],
+                "structured": {"record": True, "native_reference_id": "native-source"},
+            }
+        )
+        assert await store.receive(source_message, "credentials")
+        assert not await store.receive(source_message, "credentials")
+        assert "rkey=private" not in (await store.query("SELECT payload FROM qq_messages"))[0]["payload"]
         await store.receive(incoming("other-chat", "other"), "credentials")
         await store.query("UPDATE channel_deliveries SET tool_key = 'channels-trusted' WHERE message_id = 'source'")
         authority = {
@@ -500,12 +529,27 @@ def test_channel_tools_use_trusted_delivery_and_do_not_repeat_a_send(tmp_path, m
 
         sent = []
 
-        async def send_reply(source_account, message_id, text):
+        async def send_reply(source_account, message_id, text, **kwargs):
             assert source_account == account
-            sent.append((message_id, text))
+            sent.append((message_id, text, kwargs) if kwargs else (message_id, text))
             return "platform-message"
 
+        png = b"\x89PNG\r\n\x1a\npayload"
+        downloads = []
+        reads = []
+
+        @asynccontextmanager
+        async def download(address, authorize_url):
+            authorize_url(address)
+            downloads.append(address)
+            yield httpx.Response(200, content=png)
+
+        async def read_bytes_stream(path):
+            reads.append(path)
+            yield png
+
         monkeypatch.setattr(tools, "short_session", session)
+        monkeypatch.setattr(tools, "open_attachment", download)
         factory = tools.ChannelToolFactory()
         factory.channels = SimpleNamespace(
             host=SimpleNamespace(storage=None),
@@ -515,14 +559,17 @@ def test_channel_tools_use_trusted_delivery_and_do_not_repeat_a_send(tmp_path, m
             send_reply=send_reply,
         )
         plugin = tools.ChannelTools("channels", factory)
+        assert plugin.get_capabilities()
         ctx = SimpleNamespace(
             tool_call_id="call",
             deps=SimpleNamespace(
+                configuration=RunConfiguration(),
+                environment=SimpleNamespace(files=SimpleNamespace(read_bytes_stream=read_bytes_stream)),
                 instance=SimpleNamespace(
                     identity=SimpleNamespace(issuer="a13n-service", subject="owner"),
                     agent_instance_id="run",
                     host_refs={"run_id": "run", "attempt_id": "attempt"},
-                )
+                ),
             ),
         )
         assert [message["id"] for message in await plugin.channel_list_messages(ctx)] == ["source"]
@@ -530,6 +577,22 @@ def test_channel_tools_use_trusted_delivery_and_do_not_repeat_a_send(tmp_path, m
         assert await plugin.channel_send_message(ctx, "reply") == receipt
         assert await plugin.channel_send_message(ctx, "reply") == receipt
         assert sent == [("source", "reply")]
+        full_message = await plugin.channel_get_message(ctx, "source")
+        assert full_message["structured"]["record"] and "qq_context" not in full_message
+        assert full_message["attachments"][0]["filename"] == "photo.png"
+        image = await plugin.channel_view_attachment(ctx, 1, "source")
+        assert image.content[0].data == png and downloads == [url]
+        with pytest.raises(ModelRetry, match="selected conversation"):
+            await plugin.channel_view_attachment(ctx, 1, "other-chat", source_message_id="source")
+        assert downloads == [url]
+        ctx.tool_call_id = "rich"
+        photo = QQMedia(type="media", path="/agent/photo.png")
+        assert await plugin.channel_send_message(ctx, rich=photo, reference_message_id="source") == receipt
+        assert await plugin.channel_send_message(ctx, rich=photo, reference_message_id="source") == receipt
+        assert sent[-1] == ("source", None, {"rich": photo, "data": png, "reference_id": "native-source"})
+        assert reads == ["/agent/photo.png"]
+        assert not await store.query("SELECT text FROM channel_sends WHERE text LIKE '%photo.png%'")
+        ctx.tool_call_id = "call"
         await store.query("UPDATE channel_deliveries SET tool_key = 'channels-second' WHERE message_id = 'other-chat'")
         keys.append("channels-second")
         with pytest.raises(ModelRetry, match="Multiple channel messages"):

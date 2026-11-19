@@ -1,13 +1,17 @@
 """Outbound QQ official Bot transport."""
 
 import asyncio
+import base64
+import hashlib
 import json
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import PurePosixPath
 from typing import Annotated, Literal
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
@@ -15,6 +19,19 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import WebSocketException
 
 from a13n_channels.messages import ChannelMessage
+from a13n_channels.qq_content import (
+    MEDIA_LIMITS,
+    MEDIA_TYPES,
+    QQCard,
+    QQInbound,
+    QQMarkdown,
+    QQMedia,
+    QQRichContent,
+    image_type,
+    media_url,
+    project_content,
+    validate_rich,
+)
 
 QQ_TOKEN = "https://bots.qq.com/app/getAppAccessToken"
 QQ_API = "https://api.sgroup.qq.com"
@@ -35,6 +52,14 @@ type QQConversationKind = Literal["private", "group", "guild", "guild_dm"]
 
 type ChannelId = Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]{1,128}$")]
 type AppId = Annotated[str, Field(pattern=r"^[A-Za-z0-9_.:@-]{1,128}$")]
+
+
+class QQRejected(Exception):
+    """QQ returned a definitive application-level error."""
+
+
+class QQPartPending(Exception):
+    """QQ has not yet confirmed an uploaded part."""
 
 
 class QQSecret(BaseModel):
@@ -68,8 +93,10 @@ class Resume:
     sequence: int | None = None
 
 
-def message(channel_id: str, packet: dict) -> ChannelMessage | None:
+def message(channel_id: str, packet: dict) -> QQInbound | None:
     event = packet.get("t")
+    if event == "INTERACTION_CREATE":
+        return interaction(channel_id, packet)
     if event not in MESSAGE_TYPES:
         return None
     kind, author_field, conversation_field = MESSAGE_TYPES[event]
@@ -84,15 +111,67 @@ def message(channel_id: str, packet: dict) -> ChannelMessage | None:
             isinstance(mentions, list)
             and any(isinstance(mention, dict) and mention.get("is_you") is True for mention in mentions)
         )
-    return ChannelMessage(
+    text, attachments, urls, structured = project_content(data)
+    return QQInbound(
         id=data["id"],
         channel_id=channel_id,
         kind=kind,
         conversation_id=data[conversation_field] if conversation_field else sender,
         sender_id=sender,
-        text=(data.get("content") or "").strip(),
+        text=text,
         timestamp=data["timestamp"],
         bot_mentioned=bot_mentioned,
+        attachments=attachments,
+        attachment_urls=urls,
+        structured=structured,
+    )
+
+
+def interaction(channel_id: str, packet: dict) -> QQInbound | None:
+    data = packet["d"]
+    if data.get("type") not in {11, 12}:
+        return None
+    resolved = (data.get("data") or {}).get("resolved") or {}
+    kind = {"c2c": "private", "group": "group", "guild": "guild"}.get(data.get("scene"))
+    if kind is None:
+        kind = {2: "private", 1: "group", 0: "guild"}.get(data.get("chat_type"))
+    if kind == "private":
+        sender = conversation = data.get("user_openid") or resolved.get("user_id")
+    elif kind == "group":
+        sender, conversation = data.get("group_member_openid"), data.get("group_openid")
+    elif kind == "guild":
+        sender, conversation = resolved.get("user_id"), data.get("channel_id")
+    else:
+        return None
+    interaction_id = data.get("id")
+    event_id = packet.get("id") or interaction_id
+    if not all(
+        isinstance(value, str) and 0 < len(value) <= 1024
+        for value in (
+            sender,
+            conversation,
+            interaction_id,
+            event_id,
+        )
+    ):
+        return None
+    detail = {
+        key: resolved[key][:4096]
+        for key in ("button_data", "button_id", "feature_id", "message_id")
+        if isinstance(resolved.get(key), str)
+    }
+    return QQInbound(
+        id="interaction:" + hashlib.sha256(interaction_id.encode()).hexdigest(),
+        channel_id=channel_id,
+        kind=kind,
+        conversation_id=conversation,
+        sender_id=sender,
+        text="[QQ interaction] " + json.dumps(detail, ensure_ascii=False),
+        timestamp=data.get("timestamp") or datetime.now(UTC).isoformat(),
+        bot_mentioned=True if kind != "private" else None,
+        structured={"interaction_type": data["type"], "interaction": detail},
+        event_reply_id=event_id,
+        interaction_id=interaction_id,
     )
 
 
@@ -120,32 +199,204 @@ class QQConnection:
             self.expires = time.monotonic() + lifetime - min(60, lifetime / 3)
         return self.token
 
-    async def reply(self, incoming: ChannelMessage, text: str, sequence: int) -> str:
-        return await self._send_message(
-            incoming.kind, incoming.conversation_id, {"content": text, "msg_id": incoming.id, "msg_seq": sequence}
-        )
+    async def reply(
+        self,
+        incoming: ChannelMessage,
+        text: str | None,
+        sequence: int,
+        *,
+        rich: QQRichContent | None = None,
+        data: bytes | None = None,
+        reference_id: str | None = None,
+        event_reply_id: str | None = None,
+    ) -> str:
+        context = {"event_id": event_reply_id} if event_reply_id is not None else {"msg_id": incoming.id}
+        context["msg_seq"] = sequence
+        if reference_id is not None:
+            context["message_reference"] = {"message_id": reference_id}
+        return await self._send_message(incoming.kind, incoming.conversation_id, text, context, rich=rich, data=data)
 
-    async def send_proactive(self, kind: QQConversationKind, conversation_id: str, text: str) -> str:
-        return await self._send_message(kind, conversation_id, {"content": text})
+    async def send_proactive(
+        self,
+        kind: QQConversationKind,
+        conversation_id: str,
+        text: str | None,
+        *,
+        rich: QQRichContent | None = None,
+        data: bytes | None = None,
+    ) -> str:
+        return await self._send_message(kind, conversation_id, text, {}, rich=rich, data=data)
 
-    async def _send_message(self, kind: str, conversation_id: str, body: dict[str, str | int]) -> str:
+    async def _post(self, path: str, body: dict, *, files: dict | None = None) -> dict:
         token = await self._access_token()
-        target = quote(conversation_id, safe="")
-        if kind in {"private", "group"}:
-            body["msg_type"] = 0
-        response = await self.http.post(
-            f"{QQ_API}{MESSAGE_PATHS[kind]}/{target}/messages",
-            headers={"Authorization": f"QQBot {token}"},
-            json=body,
-        )
+        headers = {"Authorization": f"QQBot {token}"}
+        if files is None:
+            response = await self.http.post(QQ_API + path, headers=headers, json=body)
+        else:
+            fields = {key: value if isinstance(value, str) else json.dumps(value) for key, value in body.items()}
+            response = await self.http.post(QQ_API + path, headers=headers, data=fields, files=files)
+        try:
+            value = response.json() if response.content else {}
+        except ValueError:
+            response.raise_for_status()
+            raise
+        if not isinstance(value, dict):
+            response.raise_for_status()
+            raise TypeError("QQ returned an invalid response")
+        code = value.get("code", value.get("err_code"))
+        if path.endswith("/upload_part_finish") and str(code) == "40093001":
+            raise QQPartPending
         response.raise_for_status()
-        message_id = response.json()["id"]
+        if code is not None and str(code) != "0":
+            code = str(code)
+            raise QQRejected(
+                f"QQ rejected the operation (code {code if code.isascii() and code.isdigit() and len(code) < 20 else 'unknown'})."
+            )
+        return value
+
+    async def _media_upload(self, base: str, media: QQMedia, filename: str, data: bytes | None) -> str:
+        body = {"file_type": MEDIA_TYPES[media.kind], "file_name": filename, "srv_send_msg": False}
+        if data is not None and len(data) > 4 << 20:
+            upload_id = await self._upload_parts(base, body, data)
+            body = {"upload_id": upload_id, "srv_send_msg": False}
+        elif data is not None:
+            body["file_data"] = base64.b64encode(data).decode("ascii")
+        else:
+            body["url"] = media.url
+        response = await self._post(base + "/files", body)
+        receipt = response.get("file_info")
+        if not isinstance(receipt, str) or not 0 < len(receipt) <= 16384:
+            raise ValueError("QQ omitted the media upload receipt")
+        return receipt
+
+    async def _upload_parts(self, base: str, body: dict, data: bytes) -> str:
+        plan = await self._post(
+            base + "/upload_prepare",
+            {
+                "file_type": body["file_type"],
+                "file_name": body["file_name"],
+                "file_size": len(data),
+                "md5": hashlib.md5(data).hexdigest(),
+                "sha1": hashlib.sha1(data).hexdigest(),
+                "md5_10m": hashlib.md5(data[:10_002_432]).hexdigest(),
+            },
+        )
+        upload_id, block, parts = plan["upload_id"], int(plan["block_size"]), plan["parts"]
+        if (
+            not isinstance(upload_id, str)
+            or not 0 < len(upload_id) <= 1024
+            or not 0 < block <= MEDIA_LIMITS["file"]
+            or not isinstance(parts, list)
+            or not 0 < len(parts) <= 256
+            or len(parts) != (len(data) + block - 1) // block
+        ):
+            raise ValueError("QQ returned an invalid upload plan")
+        urls = {}
+        for part in parts:
+            index = int(part["index"])
+            url = media_url(part["presigned_url"])
+            host = urlsplit(url).hostname or ""
+            if index in urls or not 1 <= index <= len(parts) or not host.endswith((".myqcloud.com", ".tencentcos.cn")):
+                raise ValueError("QQ returned an invalid upload part")
+            urls[index] = url
+        async with httpx.AsyncHTTPTransport() as transport:
+            for index in range(1, len(parts) + 1):
+                chunk = data[(index - 1) * block : index * block]
+                request = httpx.Request("PUT", urls[index], content=chunk)
+                request.extensions["timeout"] = {"connect": 10, "write": 30, "read": 15, "pool": 10}
+                response = await transport.handle_async_request(request)
+                try:
+                    if not response.is_success:
+                        raise QQRejected("QQ storage did not confirm the uploaded part.")
+                finally:
+                    await response.aclose()
+                confirmation = {
+                    "upload_id": upload_id,
+                    "part_index": index,
+                    "block_size": len(chunk),
+                    "md5": hashlib.md5(chunk).hexdigest(),
+                }
+                for delay in (0, 0.4, 1):
+                    if delay:
+                        await asyncio.sleep(delay)
+                    try:
+                        await self._post(base + "/upload_part_finish", confirmation)
+                    except QQPartPending:
+                        continue
+                    break
+                else:
+                    raise QQRejected("QQ did not confirm the uploaded part before finalization.")
+        return upload_id
+
+    async def _send_message(
+        self,
+        kind: str,
+        conversation_id: str,
+        text: str | None,
+        context: dict,
+        *,
+        rich: QQRichContent | None,
+        data: bytes | None,
+    ) -> str:
+        validate_rich(kind, text, rich)
+        base = f"{MESSAGE_PATHS[kind]}/{quote(conversation_id, safe='')}"
+        body = dict(context)
+        files = None
+        message_type = 0
+        if text is not None:
+            body["content"] = text
+        if isinstance(rich, QQMarkdown):
+            body["markdown"] = rich.model_dump(exclude={"type", "keyboard"}, exclude_none=True)
+            if rich.keyboard is not None:
+                body["keyboard"] = rich.keyboard
+            message_type = 2
+        elif isinstance(rich, QQCard):
+            body[rich.type] = rich.card
+            message_type = 3 if rich.type == "ark" else 4
+        elif isinstance(rich, QQMedia):
+            source = rich.path or unquote(urlsplit(rich.url or "").path)
+            filename = rich.filename or PurePosixPath(source).name[:255] or rich.kind
+            mime = ""
+            if data is not None:
+                if not 0 < len(data) <= MEDIA_LIMITS[rich.kind]:
+                    raise ValueError("The file is empty or exceeds the QQ media size limit.")
+                if rich.kind == "image":
+                    mime = image_type(data)
+                    if not PurePosixPath(filename).suffix:
+                        filename += "." + mime.removeprefix("image/")
+            elif rich.url is None:
+                raise ValueError("The Agent Environment did not supply the media file.")
+            if kind in {"private", "group"}:
+                body["media"] = {"file_info": await self._media_upload(base, rich, filename, data)}
+                body.setdefault("content", " ")
+                message_type = 7
+            elif data is None:
+                body["image"] = rich.url
+            else:
+                files = {"file_image": (filename, data, mime)}
+        if kind in {"private", "group"}:
+            body["msg_type"] = message_type
+        message_id = (await self._post(base + "/messages", body, files=files))["id"]
         if not isinstance(message_id, str) or not message_id:
             raise ValueError("QQ omitted the sent message ID")
         return message_id
 
     async def verify_credentials(self) -> None:
         await self._access_token()
+
+    async def acknowledge_interaction(self, interaction_id: str) -> None:
+        try:
+            async with asyncio.timeout(2.5):
+                token = await self._access_token()
+                response = await self.http.put(
+                    f"{QQ_API}/interactions/{quote(interaction_id, safe='')}",
+                    headers={"Authorization": f"QQBot {token}"},
+                    json={"code": 0},
+                )
+                response.raise_for_status()
+        except (httpx.HTTPError, TimeoutError, ValueError, KeyError, TypeError):
+            # An uncertain acknowledgement must not replay a persisted event.
+            return
 
     async def test_connection(self) -> None:
         async def discard(_message: ChannelMessage) -> None:
@@ -156,7 +407,9 @@ class QQConnection:
         if not ready:
             raise ValueError("QQ closed the connection before sending READY")
 
-    async def listen(self, receive: Callable[[ChannelMessage], Awaitable[None]], status: Callable[[str], None]) -> None:
+    async def listen(
+        self, receive: Callable[[QQInbound], Awaitable[bool | None]], status: Callable[[str], None]
+    ) -> None:
         delay = 1
         while True:
             try:
@@ -171,7 +424,7 @@ class QQConnection:
 
     async def _session(
         self,
-        receive: Callable[[ChannelMessage], Awaitable[None]],
+        receive: Callable[[QQInbound], Awaitable[bool | None]],
         status: Callable[[str], None],
         *,
         stop_after_ready: bool = False,
@@ -256,7 +509,9 @@ class QQConnection:
                                 except (ValueError, KeyError, TypeError, AttributeError):
                                     incoming = None
                                 if incoming is not None and not stop_after_ready:
-                                    await receive(incoming)
+                                    inserted = await receive(incoming)
+                                    if inserted and incoming.interaction_id is not None:
+                                        await self.acknowledge_interaction(incoming.interaction_id)
                             if isinstance(packet.get("s"), int):
                                 self.resume.sequence = packet["s"]
                         case 1:

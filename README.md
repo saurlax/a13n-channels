@@ -1,6 +1,6 @@
 # Channels
 
-An a13n Service App for managing QQ bots and Weixin ClawBot in Console. The App connects to QQ by outbound WebSocket and Weixin by iLink long polling. It stores received text messages and sends replies through the source channel.
+An a13n Service App for managing QQ bots, Weixin ClawBot, and GitHub delivery in Console. It connects to QQ by outbound WebSocket and Weixin by iLink long polling. Routes deliver incoming messages to Agents and provide tools for reading conversation history and replying through the source channel.
 
 ## Prerequisites and compatibility
 
@@ -64,7 +64,7 @@ With the connector configured, select **Scan QR code** under **QQ Bot** and appr
 
 For Weixin, choose **Weixin ClawBot** in **Add channel**. Enter a name, get the QR code, then scan and confirm it in Weixin. Enter the verification code if prompted. Open the channel row to pair again. Click **Save** after approving the QR code in Weixin. Weixin supports private text messages and replies to messages with an active reply context.
 
-The Console page manages accounts and their connection status. To remove a QQ or Weixin channel, open its row and choose **Delete** in the editor footer. Confirming stops the connection and permanently deletes the channel and its locally stored messages, including messages from previous bot bindings. When a channel is paired with a different bot, incoming messages and replies use the new bot's identity. Earlier records stay associated with the previous bot. The App API supports receiving and replying to text messages, scoped to their source conversation. Disabling the App for an organization stops its connections and retains its stored accounts and messages.
+The Console page manages accounts and their connection status. To remove a QQ or Weixin channel, open its row and choose **Delete** in the editor footer. Confirming stops the connection and permanently deletes the channel and its locally stored messages, including messages from previous bot bindings. When a channel is paired with a different bot, incoming messages and replies use the new bot's identity. Earlier records stay associated with the previous bot. The App API scopes replies to their source conversation. Disabling the App for an organization stops its connections and retains its stored accounts and messages.
 
 ### GitHub and GitHub App
 
@@ -92,7 +92,7 @@ Matching sources are ranked by exact conversation ID, repository, specific accou
 
 Saving authorizes the route to submit inputs under the saving user's identity. The plugin loads that person's current workspace grants for each delivery and uses only the read and run verbs. Losing either grant pauses delivery. Saving as a different user starts fresh Threads. Routes created by the previous HTTP-based implementation require one save to authorize in-process delivery. Remove its delivery URL and Runner key settings when upgrading.
 
-Each matched message is submitted as one user input containing its source metadata and text. New messages for the same delivery binding steer a compatible active Run. The host delivers immediately when supported and otherwise incorporates the message at a safe boundary. An idle Thread starts a Run. The per-message Thread policy always starts a fresh Run. The route selects one of four Thread policies:
+Each matched message is submitted as one user input containing its source metadata, text, and any available QQ attachment and structure metadata. New messages for the same delivery binding steer a compatible active Run. The host delivers immediately when supported and otherwise incorporates the message at a safe boundary. An idle Thread starts a Run. The per-message Thread policy always starts a fresh Run. The route selects one of four Thread policies:
 
 | Policy | Thread scope |
 | --- | --- |
@@ -105,10 +105,12 @@ A new target Agent or saving user resets the route's managed Thread bindings. An
 
 The plugin submits directly through the host Service and uses the same idempotency key when retrying an uncertain submission.
 
-Channel delivery adds two Harness tools to the target Agent for that run:
+Channel delivery adds these Harness tools to the target Agent for that run:
 
-- `channel_list_messages` reads recent incoming text from the originating conversation.
-- `channel_send_message` sends a text reply of up to 2,000 characters to the originating conversation. QQ and Weixin use the original message's reply context.
+- `channel_list_messages` reads recent incoming messages and attachment metadata from the originating conversation.
+- `channel_get_message` reads one full stored message, including expanded forwards and structured content.
+- `channel_view_attachment` views a QQ image or sticker, or saves a QQ attachment into the Agent Environment.
+- `channel_send_message` sends text or QQ rich content to the originating conversation. QQ and Weixin use the original message's reply context.
 
 When a Run receives multiple channel messages, pass the intended message ID to the tools to select its conversation. Assistant text stays in Console. A channel reply requires a send tool call. The tools resolve the conversation from the run's delivery record and require a currently enabled route and account. They are available to the target Agent during channel delivery. Failed deliveries and unconfirmed sends appear in route status. A replay of the same send call never resends an unconfirmed reply.
 
@@ -118,15 +120,38 @@ In the Agent editor, open **Advanced → Plugins → Add plugin**, choose **Chan
 
 - `channel_list_accounts` lists readable channel accounts.
 - `channel_list_conversations` lists recent conversations for one account.
-- `channel_read_messages` reads incoming text from a selected conversation. Pass the last returned message ID as `before_id` to page backward.
-- `channel_send_proactive` sends up to 2,000 characters to a QQ conversation without an incoming message. Pass the channel account ID, conversation kind, and conversation ID. QQ applies its platform permissions and delivery limits.
+- `channel_read_messages` reads incoming messages from a selected conversation. Pass the last returned message ID as `before_id` to page backward.
+- `channel_read_message` reads one full stored message.
+- `channel_read_attachment` views or saves a QQ attachment using a message ID and its one-based attachment index.
+- `channel_send_proactive` sends text or rich content to a QQ conversation without an incoming message. Pass the channel account ID, conversation kind, and conversation ID. QQ applies its platform permissions and delivery limits.
 
 The configured Channels tools are available in regular, scheduled, and routed runs with workspace read access. Proactive sends additionally require workspace run access. Routed runs also receive the Channels Delivery tools for replying to the original conversation.
+
+### QQ images, stickers, records, and cards
+
+Use `channel_send_message` with `rich` set to one of the following objects. `channel_send_proactive` accepts the same content.
+
+| Content | Example `rich` value |
+| --- | --- |
+| Generated image or sticker | `{"type":"media","path":"/workspace/sticker.gif"}` |
+| Image by URL | `{"type":"media","url":"https://example.com/image.png"}` |
+| Voice, video, or file | `{"type":"media","kind":"audio","path":"/workspace/reply.wav"}` |
+| Markdown with buttons | `{"type":"markdown","content":"**Choose an option**","keyboard":{"id":"TEMPLATE_ID"}}` |
+| Markdown template | `{"type":"markdown","custom_template_id":"TEMPLATE_ID","params":[{"key":"title","values":["Status"]}]}` |
+| Ark or Embed card | `{"type":"ark","card":{"template_id":23,"kv":[{"key":"#DESC#","value":"Status"}]}}` |
+
+An image can include `text` as a caption. Send captions for other media separately. QQ C2C and group sends upload bytes or a URL to obtain a media receipt. Large files use QQ's multipart upload flow. Guild and guild DM media use the image field or an image file. The QQ reply API accepts the same text and rich message objects with HTTPS URLs for media. QQ controls availability of file types, custom cards, keyboards, quotes, and proactive messages for each bot and conversation.
+
+QQ history preserves images, custom sticker markers, emoji labels, audio, video, files, quotes, cards, and forwarded chat records supplied in Gateway events. Attachment URLs stay private. Pass `message_id` and the reported one-based `index` to `channel_view_attachment` to inspect an image or sticker. Supply an absolute Environment `save_path` for other attachments or to save a larger image. For older messages in the same conversation, identify the current delivery with `source_message_id`. Temporary QQ links can expire. A fresh message supplies a new link.
+
+Use `reference_message_id` on a reply to quote a stored message from that conversation when QQ supplies a reference identifier. To share a forwarded record's contents, send its text or a Markdown recap. QQ callback buttons and quick menus deliver an interaction to the matching route and use the event's native reply context. The bot needs the interaction intent enabled for those callbacks.
+
+[QQ send API](https://github.com/tencent-connect/bot-docs/blob/main/docs/develop/api-v2/server-inter/message/send-receive/send.md) · [QQ buttons](https://github.com/tencent-connect/bot-docs/blob/main/docs/develop/api-v2/server-inter/message/trans/msg-btn.md) · [QQ SDK media uploads](https://github.com/tencent-connect/qqbot-nodejs/blob/main/USAGE.md#10-媒体上传与发送)
 
 ## Where to make changes
 
 - `src/a13n_channels/app.py` registers the workspace account and routing APIs. `routing.py` matches sources, `delivery.py` submits inputs, and `tools.py` implements the conversation tools.
-- `src/a13n_channels/qq.py` implements QQ authentication, WebSocket handling, text replies, and proactive sends. `src/a13n_channels/accounts.py` owns account and message storage.
+- `src/a13n_channels/qq.py` implements the QQ Gateway and send APIs. `src/a13n_channels/qq_content.py` defines rich messages and projects incoming QQ content. `src/a13n_channels/accounts.py` owns account and message storage.
 - `frontend/src/index.tsx` mounts the Channels page in Console. App requests and cache keys are scoped by the host bridge.
 - `pyproject.toml` owns entry-point discovery and wheel/sdist asset packaging.
 

@@ -14,8 +14,9 @@ from a13n_service.tenancy.authorize import WorkspaceScope
 from pydantic import SecretStr
 
 from a13n_channels import app
-from a13n_channels.messages import ChannelMessage, TextReply
+from a13n_channels.messages import ChannelMessage
 from a13n_channels.qq import QQCreate
+from a13n_channels.qq_content import QQMedia, QQReply
 
 
 def test_qq_accounts_and_messages_are_owned_by_the_workspace(tmp_path, monkeypatch):
@@ -64,10 +65,14 @@ def test_qq_accounts_and_messages_are_owned_by_the_workspace(tmp_path, monkeypat
             finally:
                 stopped.set()
 
-        async def reply(self, incoming, text, sequence):
+        async def reply(self, incoming, text, sequence, **options):
             assert incoming.id == "msg-1"
             assert incoming.channel_id == self.channel_id
-            assert text == "world"
+            if options:
+                assert text is None
+                assert options["rich"].url == "https://assets.example.com/photo.png"
+            else:
+                assert text == "world"
             return f"sent-{sequence}"
 
     monkeypatch.setattr(app, "QQConnection", QQFixture)
@@ -124,8 +129,10 @@ def test_qq_accounts_and_messages_are_owned_by_the_workspace(tmp_path, monkeypat
                 await delete(account.id, runtime, "writer", "ws_other")
             assert [item.id for item in await messages(account.id, "ws_qq")] == ["msg-1"]
             for sequence in (1, 2):
-                receipt = await reply(account.id, TextReply(text="world"), runtime, "writer", "ws_qq", "msg-1")
+                receipt = await reply(account.id, QQReply(text="world"), runtime, "writer", "ws_qq", "msg-1")
                 assert receipt == {"message_id": f"sent-{sequence}"}
+            image = QQReply(rich=QQMedia(type="media", url="https://assets.example.com/photo.png"))
+            assert await reply(account.id, image, runtime, "writer", "ws_qq", "msg-1") == {"message_id": "sent-3"}
             with pytest.raises(ServiceError, match="AppSecret is required"):
                 await update(account.id, app.QQEdit(app_id="10002"), runtime, "writer", "ws_qq")
             edited = await update(
@@ -135,7 +142,7 @@ def test_qq_accounts_and_messages_are_owned_by_the_workspace(tmp_path, monkeypat
             await asyncio.wait_for(stopped.wait(), timeout=2)
             assert await messages(account.id, "ws_qq") == []
             with pytest.raises(ServiceError, match="qq_message"):
-                await reply(account.id, TextReply(text="world"), runtime, "writer", "ws_qq", "msg-1")
+                await reply(account.id, QQReply(text="world"), runtime, "writer", "ws_qq", "msg-1")
             with closing(sqlite3.connect(state)) as db:
                 assert db.execute("SELECT message_id FROM qq_messages").fetchall() == [("msg-1",)]
                 await delete(account.id, runtime, "writer", "ws_qq")
