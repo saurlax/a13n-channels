@@ -636,3 +636,70 @@ def test_history_tools_filter_accounts_and_read_only_the_selected_conversation(t
             await plugin.channel_list_accounts(ctx)
 
     asyncio.run(exercise())
+
+
+def test_repository_sources_and_account_allowlists_round_trip(tmp_path):
+    async def exercise():
+        store = store_for(tmp_path)
+        await store.initialize()
+        with store.transaction() as db:
+            db.execute(
+                "INSERT INTO github_accounts VALUES ('gh', 'org', 'workspace', 'GitHub', 'github_app', 'bot', '{}', '')"
+            )
+            db.execute("INSERT INTO qq_accounts VALUES ('qq', 'org', 'workspace', 'Bot', 'bot', 'credentials', 1)")
+        body = RouteInput(
+            name="Repository and group",
+            agent_id="agent",
+            sources=[
+                Source(channel_id="gh", kind="*", conversation_id="*", repository="Owner/Repo"),
+                Source(channel_id="qq", kind="group", conversation_id="*"),
+            ],
+            allowed_users={"gh": ["Alice"], "qq": ["qq-sender"]},
+        )
+        saved = await store.save_route("workspace", "repo", body, principal_id="owner", create=True)
+        routes = await store.routes("workspace")
+        assert routes == [saved]
+        github_account = (await store.query("SELECT * FROM github_accounts"))[0]
+        assert await store.github_repositories(github_account) == {"owner/repo"}
+        assert select_route(routes, "gh", "issue", "owner/repo#7", sender_id="alice") == saved
+        assert select_route(routes, "gh", "pull_request", "OWNER/REPO#8", sender_id="ALICE") == saved
+        assert select_route(routes, "gh", "issue", "owner/other#7", sender_id="alice") is None
+        assert select_route(routes, "gh", "issue", "owner/repo#7", sender_id="bob") is None
+        assert select_route(routes, "qq", "group", "room", sender_id="qq-sender") == saved
+        assert select_route(routes, "qq", "group", "room", sender_id="alice") is None
+        with pytest.raises(ServiceError, match="already belongs"):
+            duplicate = body.model_copy(
+                update={"sources": [Source(channel_id="gh", kind="*", conversation_id="*", repository="owner/repo")]}
+            )
+            await store.save_route("workspace", "duplicate", duplicate, principal_id="owner", create=True)
+        with pytest.raises(ServiceError, match="allowed users"):
+            await store.save_route(
+                "workspace", "repo", body.model_copy(update={"allowed_users": {}}), principal_id="owner", create=False
+            )
+
+    asyncio.run(exercise())
+
+
+def test_legacy_github_route_preserves_wildcard_account_scope_on_save(tmp_path):
+    async def exercise():
+        store = store_for(tmp_path)
+        await store.initialize()
+        config = {
+            "sources": [{"channel_id": "*", "kind": "issue", "conversation_id": "*"}],
+            "github_filter": {"repositories": ["owner/repo"], "users": ["Alice"]},
+        }
+        with store.transaction() as db:
+            db.execute(
+                "INSERT INTO channel_routes VALUES ('legacy', 'workspace', 'Legacy', 'agent', 1, ?, 'binding', 'owner')",
+                (json.dumps(config),),
+            )
+        (before,) = await store.routes("workspace")
+        body = RouteInput.model_validate(before.model_dump())
+        await store.save_route("workspace", "legacy", body, principal_id="owner", create=False)
+        routes = await store.routes("workspace")
+        assert routes == [before]
+        assert select_route(routes, "gh", "issue", "owner/repo#7", sender_id="alice") == before
+        assert select_route(routes, "gh", "issue", "owner/repo#7", sender_id="bob") is None
+        assert select_route(routes, "gh", "pull_request", "owner/repo#7", sender_id="alice") is None
+
+    asyncio.run(exercise())

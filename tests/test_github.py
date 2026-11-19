@@ -103,7 +103,12 @@ def test_github_bind_poll_and_reply(app):
 
 
 def test_github_route_filter_requires_both_repository_and_user():
-    source = Source(channel_id="github-test", kind="issue", conversation_id="*")
+    source = Source(
+        channel_id="github-test",
+        kind="issue",
+        conversation_id="*",
+        github_filter={"repositories": ["Owner/Repo"], "users": ["Alice"]},
+    )
     route = Route(
         id="test",
         binding_id="binding",
@@ -111,12 +116,19 @@ def test_github_route_filter_requires_both_repository_and_user():
         name="Test",
         agent_id="agent",
         sources=[source],
-        github_filter={"repositories": ["Owner/Repo"], "users": ["Alice"]},
     )
     other = route.model_copy(
-        update={"id": "other", "github_filter": route.github_filter.model_copy(update={"users": ["bob"]})}
+        update={
+            "id": "other",
+            "sources": [
+                source.model_copy(update={"github_filter": source.github_filter.model_copy(update={"users": ["bob"]})})
+            ],
+        }
     )
     validate_route(other, [route], other.id, {"github-test"})
+    combined = route.model_copy(update={"sources": [source, *other.sources]})
+    validate_route(combined, [], combined.id, {"github-test"})
+    assert select_route([combined], "github-test", "issue", "owner/repo#7", sender_id="bob") == combined
     with pytest.raises(ServiceError, match="already belongs"):
         validate_route(route, [route], "duplicate", {"github-test"})
     assert select_route([route, other], "github-test", "issue", "owner/repo#7", sender_id="ALICE") == route
@@ -125,7 +137,7 @@ def test_github_route_filter_requires_both_repository_and_user():
     assert select_route([route], "github-test", "issue", "owner/repo#7", sender_id="unknown") is None
     assert (
         select_route(
-            [route.model_copy(update={"github_filter": None})],
+            [route.model_copy(update={"sources": [source.model_copy(update={"github_filter": None})]})],
             "github-test",
             "issue",
             "owner/repo#7",

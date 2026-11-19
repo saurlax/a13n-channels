@@ -15,8 +15,10 @@ const english = {
   sourceLimit: "Use at most 100 source rules, counting each conversation ID.",
   missing: "Unavailable", selectChannel: "Select a channel account",
   private: "Private chat", group: "Group chat", guild: "Guild channel", guild_dm: "Guild direct message",
-  githubRepositories: "GitHub repositories", githubUsers: "Allowed GitHub users",
-  githubHelp: "Separate entries with commas. GitHub messages require both filters.",
+  all: "All", repository: "Repository", allowedUsers: "Allowed users", user: "User",
+  addUser: "Add users", removeUser: "Remove allowed users", usersPlaceholder: "Separate user IDs with commas",
+  invalidUsers: "Choose a channel account and enter valid users for each row.",
+  replaceSource: "Replace legacy source", legacySource: "Existing rule",
   githubError: "Enter GitHub repositories and allowed users.",
   filters: "Filters", multiparty: "Group and channel messages",
   mentionsOnly: "Only @bot", allMessages: "All messages", originalFilters: "Keep current source filters",
@@ -54,8 +56,10 @@ const chinese: typeof english = {
   sourceLimit: "来源规则最多 100 条，每个会话 ID 各算一条。",
   missing: "不可用", selectChannel: "选择渠道账号",
   private: "私聊", group: "群聊", guild: "频道子频道", guild_dm: "频道私信",
-  githubRepositories: "GitHub 仓库", githubUsers: "允许触发的 GitHub 用户",
-  githubHelp: "用逗号分隔多个值。GitHub 消息需要同时匹配这两项。",
+  all: "全部", repository: "仓库", allowedUsers: "允许的用户", user: "用户",
+  addUser: "添加用户", removeUser: "移除允许的用户", usersPlaceholder: "多个用户 ID 用逗号分隔",
+  invalidUsers: "请为每行选择渠道账号并填写有效的用户。",
+  replaceSource: "替换旧来源", legacySource: "已有规则",
   githubError: "请填写 GitHub 仓库和允许触发的用户。",
   filters: "筛选器", multiparty: "多人聊天消息",
   mentionsOnly: "仅 @ 机器人", allMessages: "全量消息", originalFilters: "保留已有来源筛选",
@@ -85,7 +89,7 @@ const chinese: typeof english = {
 
 type Account = { id: string; name: string; platform: Platform; conversation_kinds: string[] };
 type Agent = { id: string; name: string };
-type Source = { channel_id: string; kind: string; conversation_id: string; mentions_only?: boolean };
+type Source = { channel_id: string; kind: string; conversation_id: string; mentions_only?: boolean; repository?: string | null; github_filter?: GitHubFilter | null };
 type MultipartyFilter = "all" | "mentions";
 type ThreadPolicy = keyof typeof english.policies;
 const threadPolicies: ThreadPolicy[] = ["conversation", "sender", "fixed", "message"];
@@ -94,39 +98,56 @@ type RouteInput = {
   name: string; agent_id: string; enabled: boolean; sources: Source[];
   thread_policy: ThreadPolicy; fixed_thread_id: string | null;
   multiparty_messages: MultipartyFilter | null; wake_agent_id: string | null;
-  github_filter: GitHubFilter | null;
+  allowed_users: Record<string, string[]>;
 };
 type Route = RouteInput & { id: string; attention: number; needs_authorization: boolean };
 type RouteList = { configured: boolean; routes: Route[] };
 type Text = typeof english;
 
-type SourceDraft = Omit<Source, "conversation_id"> & { conversations: string[]; input: string };
+type SourceDraft = Pick<Source, "channel_id" | "kind" | "mentions_only"> & {
+  conversations: string[]; input: string; legacy?: Source;
+};
+type UserDraft = { id: number; channelId: string; users: string };
 
-const sourceDefaults = (): SourceDraft => ({ channel_id: "", kind: "private", conversations: [], input: "" });
+const isGitHub = (account?: Account) => account?.platform === "github" || account?.platform === "github_app";
+const repoPattern = "[A-Za-z0-9_\\-]+/[A-Za-z0-9_.\\-]+";
+const validRepo = (value: string) => value.length <= 150 && new RegExp(`^${repoPattern}$`).test(value);
+const splitList = (value: string) => value.split(/[,，]/).map(item => item.trim()).filter(Boolean);
+const accountOption = (account: Account) => ({
+  value: account.id, label: account.name, icon: <ChannelIcon platform={account.platform} />,
+});
+
+const sourceDefaults = (): SourceDraft => ({ channel_id: "", kind: "*", conversations: [], input: "" });
 
 function draftSources(sources: Source[]): SourceDraft[] {
   const rows: SourceDraft[] = [];
   const groups = new Map<string, SourceDraft>();
-  for (const { conversation_id, ...source } of sources) {
-    const key = JSON.stringify([source.channel_id, source.kind, Boolean(source.mentions_only)]);
-    const existing = conversation_id === "*" ? undefined : groups.get(key);
-    if (existing) {
-      existing.conversations.push(conversation_id);
+  for (const source of sources) {
+    const { channel_id, kind, mentions_only, conversation_id, repository, github_filter } = source;
+    const draft = { ...sourceDefaults(), channel_id, kind, mentions_only };
+    if (github_filter || (channel_id === "*" && kind !== "*") ||
+        ((kind === "issue" || kind === "pull_request") && conversation_id !== "*")) {
+      rows.push({ ...draft, legacy: source });
       continue;
     }
-    const conversations = conversation_id === "*" ? [] : [conversation_id];
-    const row = { ...source, conversations, input: "" };
+    const conversation = repository ?? conversation_id;
+    const key = JSON.stringify([channel_id, kind, Boolean(mentions_only), Boolean(repository)]);
+    const existing = conversation === "*" ? undefined : groups.get(key);
+    if (existing) {
+      existing.conversations.push(conversation);
+      continue;
+    }
+    const row = { ...draft, conversations: conversation === "*" ? [] : [conversation] };
     rows.push(row);
-    if (conversations.length) groups.set(key, row);
+    if (row.conversations.length) groups.set(key, row);
   }
   return rows;
 }
 
-function conversationIds({ conversations, input }: SourceDraft): string[] {
-  const id = input.trim();
-  return id ? [...new Set([...conversations, id])] : conversations;
+function conversationIds({ conversations, input }: SourceDraft, github: boolean): string[] {
+  const ids = [...conversations, input.trim()].filter(Boolean);
+  return [...new Set(github ? ids.map(id => id.toLowerCase()) : ids)];
 }
-
 
 function kindName(kind: string, text: Text) {
   switch (kind) {
@@ -155,15 +176,18 @@ function SourceEditor({ source, accounts, update, remove, text, disabled }: {
   const app = useApp();
   const optionsId = React.useId();
   const account = accounts.find(item => item.id === source.channel_id);
-  const allKinds = [...new Set(accounts.flatMap(item => item.conversation_kinds))];
-  const supported = ["*", ...(account?.conversation_kinds ?? allKinds)];
+  const github = isGitHub(account);
+  const supported = ["*", ...(account?.conversation_kinds ?? [])];
+  const kind = account && !source.legacy ? source.kind : "*";
+  const conversationLabel = github ? text.repository : text.conversationId;
   function addConversation() {
-    if (source.input.trim() === "*") return;
-    update({ ...source, conversations: conversationIds(source), input: "" });
+    const value = source.input.trim();
+    if (value === "*" || (github && value && !validRepo(value))) return;
+    update({ ...source, conversations: conversationIds(source, github), input: "" });
   }
   const observed = useQuery({
     queryKey: app.queryKey("route-sources", source.channel_id, source.kind),
-    enabled: Boolean(account && !disabled && source.kind !== "*"),
+    enabled: Boolean(account && !github && !disabled && !source.legacy && kind !== "*"),
     queryFn: async ({ signal }) => responseJSON<{ id: string }[]>(await app.request(
       "/route-sources?" + new URLSearchParams({ channel_id: source.channel_id, kind: source.kind }),
       { signal },
@@ -176,27 +200,36 @@ function SourceEditor({ source, accounts, update, remove, text, disabled }: {
           placeholder={text.selectChannel}
           options={[
             { value: "*", label: text.anyChannel },
-            ...accounts.map(item => ({
-              value: item.id, label: item.name, icon: <ChannelIcon platform={item.platform} />,
-            })),
+            ...accounts.map(accountOption),
             ...(source.channel_id && source.channel_id !== "*" && !account
               ? [{ value: source.channel_id, label: `${text.missing} (${source.channel_id})` }] : []),
           ]}
-          onChange={id => {
-            const kinds = accounts.find(item => item.id === id)?.conversation_kinds ?? allKinds;
-            const kind = source.kind === "*" || kinds.includes(source.kind) ? source.kind : kinds[0] ?? "*";
-            update({ ...source, channel_id: id, kind, conversations: [], input: "",
-              mentions_only: kind === source.kind && source.mentions_only });
-          }} />
+          onChange={id => update({ ...sourceDefaults(), channel_id: id })} />
       </td>
       <td>
-        <ChannelSelect label={text.kind} disabled={disabled} value={source.kind}
-          options={(supported.includes(source.kind) ? supported : [source.kind, ...supported])
-            .map(kind => ({ value: kind, label: kindName(kind, text) }))}
-          onChange={kind => update({ ...source, kind, mentions_only: false, conversations: [], input: "" })} />
+        <ChannelSelect label={text.kind} disabled={disabled || !account || Boolean(source.legacy)} value={kind}
+          options={(supported.includes(kind) ? supported : [kind, ...supported])
+            .map(value => ({ value, label: value === "*" && account && !source.legacy ? text.all : kindName(value, text) }))}
+          onChange={kind => update({ ...source, kind, mentions_only: false,
+            conversations: github ? source.conversations : [], input: github ? source.input : "" })} />
       </td>
       <td>
-        {source.kind === "*" ? <span>{text.anyConversation}</span> : (
+        {source.legacy ? (
+          <>
+            <p className="a13n-route-thread-help">{text.legacySource} · {[
+              kindName(source.kind, text),
+              source.legacy.conversation_id !== "*" ? source.legacy.conversation_id : null,
+              ...source.legacy.github_filter?.repositories ?? [],
+              ...source.legacy.github_filter?.users ?? [],
+            ].filter(Boolean).join(" · ")}</p>
+            {!disabled && <Button type="button" size="sm" variant="outline"
+              onClick={() => update({ ...sourceDefaults(), channel_id: account?.id ?? "" })}>
+              {text.replaceSource}
+            </Button>}
+          </>
+        ) : !account || (!github && kind === "*") ? (
+          <span className="a13n-route-all-conversations">{text.anyConversation}</span>
+        ) : (
           <div className="a13n-route-conversations">
             {source.conversations.map(id => (
               <span className="a13n-route-conversation-tag" key={id}>
@@ -207,9 +240,10 @@ function SourceEditor({ source, accounts, update, remove, text, disabled }: {
                 </button>}
               </span>
             ))}
-            <Input unstyled aria-label={text.conversationId} disabled={disabled} list={optionsId}
-              placeholder={source.conversations.length ? text.conversationId : text.conversationPlaceholder}
-              value={source.input} maxLength={512} pattern={String.raw`(?!\s*\*\s*$).*`}
+            <Input unstyled aria-label={conversationLabel} disabled={disabled} list={github ? undefined : optionsId}
+              placeholder={github ? "owner/repo" : source.conversations.length ? conversationLabel : text.conversationPlaceholder}
+              value={source.input} maxLength={github ? 150 : 512}
+              pattern={github ? repoPattern : String.raw`(?!\s*\*\s*$).*`}
               onChange={event => update({ ...source, input: event.currentTarget.value })}
               onBlur={() => { if (source.input) addConversation(); }}
               onKeyDown={event => {
@@ -284,8 +318,6 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
   const navigate = useNavigate();
   const [name, setName] = React.useState(route?.name ?? "");
   const [agent, setAgent] = React.useState(route?.agent_id ?? "");
-  const [githubRepositories, setGitHubRepositories] = React.useState(route?.github_filter?.repositories.join(", ") ?? "");
-  const [githubUsers, setGitHubUsers] = React.useState(route?.github_filter?.users.join(", ") ?? "");
   const [wakeAgent, setWakeAgent] = React.useState(route?.wake_agent_id ?? "");
   const legacyFilters = route?.multiparty_messages == null && Boolean(route?.sources.some(source => source.mentions_only));
   const [multiparty, setMultiparty] = React.useState<MultipartyFilter | "legacy">(
@@ -299,17 +331,15 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
   const [sources, setSources] = React.useState(
     () => (route ? draftSources(route.sources) : [sourceDefaults()]).map((value, id) => ({ id, value })),
   );
+  const [allowedUsers, setAllowedUsers] = React.useState<UserDraft[]>(() =>
+    Object.entries(route?.allowed_users ?? {}).map(([channelId, users], id) => ({ id, channelId, users: users.join(", ") })),
+  );
+  const nextUser = React.useRef(allowedUsers.length);
   const nextSource = React.useRef(sources.length);
   const [deleting, setDeleting] = React.useState(false);
   const [pending, setPending] = React.useState(false);
   const [error, setError] = React.useState("");
   const disabled = pending || !canEdit;
-  const githubAccounts = accounts.filter(item => item.platform === "github" || item.platform === "github_app");
-  const explicitGitHub = sources.some(({ value }) =>
-    value.kind === "issue" || value.kind === "pull_request" || githubAccounts.some(item => item.id === value.channel_id),
-  );
-  const showGitHub = explicitGitHub || sources.some(({ value }) => value.channel_id === "*" && value.kind === "*")
-    && (githubAccounts.length > 0 || Boolean(route?.github_filter));
   const canRemoveSource = canEdit && sources.length > 1;
 
   function returnToList() {
@@ -320,24 +350,38 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (disabled) return;
-    const savedSources = sources.flatMap(({ value }) => {
-      const ids = conversationIds(value);
-      return (ids.length ? ids : ["*"]).map(conversation_id => ({
-        channel_id: value.channel_id,
-        kind: value.kind,
-        conversation_id,
-        ...(multiparty === "legacy" ? { mentions_only: value.mentions_only } : {}),
-      }));
-    });
+    const usersByAccount = new Map<string, string[]>();
+    for (const row of allowedUsers) {
+      const users = splitList(row.users);
+      const account = accounts.find(item => item.id === row.channelId);
+      if (!account || !users.length || (isGitHub(account) && users.some(user => !/^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/.test(user)))) {
+        setError(text.invalidUsers);
+        return;
+      }
+      usersByAccount.set(account.id, [...new Set([...(usersByAccount.get(account.id) ?? []), ...users])]);
+    }
+    const savedSources: Source[] = [];
+    for (const { value } of sources) {
+      if (value.legacy) {
+        savedSources.push({ ...value.legacy, mentions_only: multiparty === "legacy" && value.mentions_only });
+        continue;
+      }
+      const github = isGitHub(accounts.find(item => item.id === value.channel_id));
+      const ids = conversationIds(value, github);
+      if (github && (ids.some(id => !validRepo(id)) || (enabled && (!ids.length || !usersByAccount.has(value.channel_id))))) {
+        setError(text.githubError);
+        return;
+      }
+      for (const id of ids.length ? ids : ["*"]) {
+        savedSources.push({
+          channel_id: value.channel_id, kind: value.kind, conversation_id: github ? "*" : id,
+          ...(github && id !== "*" ? { repository: id } : {}),
+          ...(multiparty === "legacy" ? { mentions_only: value.mentions_only } : {}),
+        });
+      }
+    }
     if (savedSources.length > 100) {
       setError(text.sourceLimit);
-      return;
-    }
-    const repositories = githubRepositories.split(",").map(value => value.trim()).filter(Boolean);
-    const users = githubUsers.split(",").map(value => value.trim()).filter(Boolean);
-    const githubFilter = showGitHub && (repositories.length || users.length) ? { repositories, users } : null;
-    if ((githubFilter || (explicitGitHub && enabled)) && (!repositories.length || !users.length)) {
-      setError(text.githubError);
       return;
     }
     setPending(true);
@@ -348,7 +392,7 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           name, agent_id: agent, enabled,
-          sources: savedSources, github_filter: githubFilter,
+          sources: savedSources, allowed_users: Object.fromEntries(usersByAccount),
           multiparty_messages: multiparty === "legacy" ? null : multiparty, wake_agent_id: wakeAgent || null,
           thread_policy: policy, fixed_thread_id: policy === "fixed" ? threadId.trim() || null : null,
         } satisfies RouteInput),
@@ -359,6 +403,8 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
         setError(text.busyThread);
       } else if (error instanceof ApiError && error.details.field === "github_filter") {
         setError(text.githubError);
+      } else if (error instanceof ApiError && error.details.field === "allowed_users") {
+        setError(text.invalidUsers);
       } else if (error instanceof ApiError && error.details.field === "wake_agent_id") {
         setError(text.wakeError);
       } else if (error instanceof ApiError && error.details.field === "fixed_thread_id") {
@@ -444,16 +490,47 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
                   ? [{ value: wakeAgent, label: `${text.missing} (${wakeAgent})`, disabled: true }] : []),
               ]} />
           </div>
-          {showGitHub && <>
-            <div className="a13n-route-settings">
-              <label>{text.githubRepositories}<Input value={githubRepositories} disabled={disabled}
-                placeholder="owner/repo" onChange={event => setGitHubRepositories(event.currentTarget.value)} /></label>
-              <label>{text.githubUsers}<Input value={githubUsers} disabled={disabled}
-                placeholder="octocat" onChange={event => setGitHubUsers(event.currentTarget.value)} /></label>
-            </div>
-            <p className="a13n-route-thread-help">{text.githubHelp}</p>
-          </>}
           <p className="a13n-route-thread-help">{text.wakeHelp}</p>
+          <div className="a13n-route-section-header">
+            <h3>{text.allowedUsers}</h3>
+            {canEdit && <Button type="button" size="sm" variant="outline" disabled={disabled || !accounts.length || allowedUsers.length >= 100}
+              onClick={() => {
+                const id = nextUser.current++;
+                setAllowedUsers(current => [...current, { id, channelId: "", users: "" }]);
+              }}>{text.addUser}</Button>}
+          </div>
+          {allowedUsers.length > 0 && <div className="a13n-route-source-table a13n-route-user-table">
+            <table aria-label={text.allowedUsers}>
+              <colgroup><col /><col />{canEdit && <col className="a13n-route-source-action" />}</colgroup>
+              <thead><tr>
+                <th scope="col">{text.channel}</th><th scope="col">{text.user}</th>
+                {canEdit && <th scope="col" aria-label={text.removeUser} />}
+              </tr></thead>
+              <tbody>{allowedUsers.map(row => (
+                <tr key={row.id}>
+                  <td><ChannelSelect label={text.channel} required disabled={disabled} value={row.channelId || null}
+                    placeholder={text.selectChannel}
+                    options={[
+                      ...accounts.map(accountOption),
+                      ...(row.channelId && !accounts.some(account => account.id === row.channelId)
+                        ? [{ value: row.channelId, label: `${text.missing} (${row.channelId})` }] : []),
+                    ]}
+                    onChange={channelId => setAllowedUsers(current => current.map(item =>
+                      item.id === row.id ? { ...item, channelId, users: "" } : item))} /></td>
+                  <td><Input aria-label={text.user} required disabled={disabled} value={row.users}
+                    placeholder={isGitHub(accounts.find(account => account.id === row.channelId)) ? "octocat" : text.usersPlaceholder}
+                    onChange={event => {
+                      const users = event.currentTarget.value;
+                      setAllowedUsers(current => current.map(item => item.id === row.id ? { ...item, users } : item));
+                    }} /></td>
+                  {canEdit && <td className="a13n-route-source-action">
+                    <Button type="button" size="icon-sm" variant="ghost" disabled={disabled} aria-label={text.removeUser}
+                      onClick={() => setAllowedUsers(current => current.filter(item => item.id !== row.id))}>×</Button>
+                  </td>}
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>}
         </section>
         {error && <p role="alert">{error}</p>}
         {canEdit && <>
@@ -529,7 +606,7 @@ export function RoutePage({ nav, base, routeKey }: { nav: React.ReactNode; base:
   const sourceName = (source: Source) => {
     const channel = source.channel_id === "*" ? text.anyChannel :
       accounts.data?.accounts.find(item => item.id === source.channel_id)?.name ?? source.channel_id;
-    return [channel, kindName(source.kind, text), source.conversation_id === "*" ? null : source.conversation_id]
+    return [channel, kindName(source.kind, text), source.repository ?? (source.conversation_id === "*" ? null : source.conversation_id)]
       .filter(Boolean).join(" · ");
   };
   return (

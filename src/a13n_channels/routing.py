@@ -3,6 +3,7 @@
 import json
 import sqlite3
 from hashlib import sha256
+from itertools import combinations
 from typing import Annotated, Literal
 
 from a13n_service.infra.errors import ServiceError
@@ -62,36 +63,6 @@ SCHEMA = """
 MULTIPARTY_KINDS = {"group", "guild", "channel", "thread", "issue", "pull_request"}
 
 
-class Source(BaseModel, frozen=True):
-    channel_id: Choice
-    kind: Kind
-    conversation_id: Choice
-    mentions_only: bool = False
-
-    @model_validator(mode="after")
-    def validate_wildcard(self) -> "Source":
-        if self.kind == "*" and self.conversation_id != "*":
-            raise ValueError("An exact conversation requires a conversation type.")
-        if self.mentions_only and self.kind not in MULTIPARTY_KINDS:
-            raise ValueError("Mention filtering requires a group or channel conversation type.")
-        return self
-
-    @property
-    def address(self) -> tuple[str, str, str]:
-        return self.channel_id, self.kind, self.conversation_id
-
-    @property
-    def specificity(self) -> tuple[bool, bool, bool]:
-        return (self.conversation_id != "*", self.channel_id != "*", self.kind != "*")
-
-    def matches(self, channel_id: str, kind: str, conversation_id: str) -> bool:
-        return (
-            self.channel_id in {"*", channel_id}
-            and self.kind in {"*", kind}
-            and self.conversation_id in {"*", conversation_id}
-        )
-
-
 class GitHubFilter(BaseModel):
     repositories: list[RepositoryName] = Field(min_length=1, max_length=30)
     users: list[Login] = Field(min_length=1, max_length=30)
@@ -102,9 +73,48 @@ class GitHubFilter(BaseModel):
         self.users = list(dict.fromkeys(name.lower() for name in self.users))
         return self
 
-    def matches(self, conversation_id: str, sender_id: str | None) -> bool:
-        repository = conversation_id.rpartition("#")[0]
-        return repository.lower() in self.repositories and (sender_id or "").lower() in self.users
+
+class Source(BaseModel, frozen=True):
+    channel_id: Choice
+    kind: Kind
+    conversation_id: Choice
+    mentions_only: bool = False
+    repository: RepositoryName | None = None
+    github_filter: GitHubFilter | None = None
+
+    @model_validator(mode="after")
+    def validate_wildcard(self) -> "Source":
+        if self.repository and (
+            self.channel_id == "*"
+            or self.kind not in {"*", *GITHUB_KINDS}
+            or self.conversation_id != "*"
+            or self.github_filter is not None
+        ):
+            raise ValueError("A repository requires a GitHub account and repository-level conversation matching.")
+        if self.kind == "*" and self.conversation_id != "*":
+            raise ValueError("An exact conversation requires a conversation type.")
+        if self.mentions_only and self.kind not in MULTIPARTY_KINDS:
+            raise ValueError("Mention filtering requires a group or channel conversation type.")
+        return self
+
+    @property
+    def address(self) -> tuple[str, str, str, str | None]:
+        return self.channel_id, self.kind, self.conversation_id, self.repository.lower() if self.repository else None
+
+    @property
+    def specificity(self) -> tuple[bool, bool, bool, bool]:
+        return (self.conversation_id != "*", self.repository is not None, self.channel_id != "*", self.kind != "*")
+
+    def matches(self, channel_id: str, kind: str, conversation_id: str) -> bool:
+        return (
+            self.channel_id in {"*", channel_id}
+            and self.kind in {"*", kind}
+            and self.conversation_id in {"*", conversation_id}
+            and (
+                self.repository is None
+                or (kind in GITHUB_KINDS and conversation_id.rpartition("#")[0].lower() == self.repository.lower())
+            )
+        )
 
 
 class RouteInput(BaseModel):
@@ -116,12 +126,37 @@ class RouteInput(BaseModel):
     fixed_thread_id: Choice | None = None
     multiparty_messages: Literal["all", "mentions"] | None = None
     wake_agent_id: Choice | None = None
-    github_filter: GitHubFilter | None = None
+    allowed_users: dict[Choice, Annotated[list[Choice], Field(min_length=1, max_length=100)]] = Field(
+        default_factory=dict, max_length=100
+    )
+
+    def github_repositories(self, source: Source, channel_id: str) -> list[str]:
+        if source.channel_id not in {"*", channel_id} or source.kind not in {"*", *GITHUB_KINDS}:
+            return []
+        if source.github_filter:
+            return source.github_filter.repositories
+        return [source.repository.lower()] if source.repository and self.allowed_users.get(channel_id) else []
+
+    def github_users(self, source: Source, channel_id: str) -> set[str]:
+        users = {user.lower() for user in self.allowed_users.get(channel_id, [])}
+        if source.github_filter:
+            legacy = set(source.github_filter.users)
+            return legacy & users if users else legacy
+        return users if source.repository else set()
+
+    def matches_sender(
+        self, source: Source, channel_id: str, kind: str, conversation_id: str, sender_id: str | None
+    ) -> bool:
+        users = self.allowed_users.get(channel_id)
+        if kind in GITHUB_KINDS:
+            return (sender_id or "").lower() in self.github_users(source, channel_id) and (
+                source.github_filter is None
+                or conversation_id.rpartition("#")[0].lower() in source.github_filter.repositories
+            )
+        return users is None or sender_id in users
 
     @model_validator(mode="after")
     def unique_sources(self) -> "RouteInput":
-        if len({source.address for source in self.sources}) != len(self.sources):
-            raise ValueError("Remove duplicate sources.")
         if self.fixed_thread_id is not None and self.thread_policy != "fixed":
             raise ValueError("A Thread ID requires the fixed Thread policy.")
         if self.wake_agent_id == self.agent_id:
@@ -135,19 +170,33 @@ class Route(RouteInput):
     principal_id: str | None
 
 
+def github_channel_ids(db: sqlite3.Connection, workspace_id: str) -> set[str]:
+    return {row[0] for row in db.execute("SELECT id FROM github_accounts WHERE workspace_id = ?", (workspace_id,))}
+
+
 def read_routes(db: sqlite3.Connection, workspace_id: str) -> list[Route]:
-    return [
-        Route(
-            id=row["id"],
-            binding_id=row["binding_id"],
-            principal_id=row["principal_id"],
-            name=row["name"],
-            agent_id=row["agent_id"],
-            enabled=bool(row["enabled"]),
-            **json.loads(row["sources"]),
+    channels = github_channel_ids(db, workspace_id)
+    routes = []
+    for row in db.execute("SELECT * FROM channel_routes WHERE workspace_id = ? ORDER BY name, id", (workspace_id,)):
+        config = json.loads(row["sources"])
+        if legacy := config.pop("github_filter", None):
+            for source in config["sources"]:
+                if source["kind"] in GITHUB_KINDS or (
+                    source["kind"] == "*" and source["channel_id"] in channels | {"*"}
+                ):
+                    source.setdefault("github_filter", legacy)
+        routes.append(
+            Route(
+                id=row["id"],
+                binding_id=row["binding_id"],
+                principal_id=row["principal_id"],
+                name=row["name"],
+                agent_id=row["agent_id"],
+                enabled=bool(row["enabled"]),
+                **config,
+            )
         )
-        for row in db.execute("SELECT * FROM channel_routes WHERE workspace_id = ? ORDER BY name, id", (workspace_id,))
-    ]
+    return routes
 
 
 def select_route(
@@ -164,10 +213,7 @@ def select_route(
         for route in routes
         for source in route.sources
         if source.matches(channel_id, kind, conversation_id)
-        and (
-            kind not in GITHUB_KINDS
-            or (route.github_filter and route.github_filter.matches(conversation_id, sender_id))
-        )
+        and route.matches_sender(source, channel_id, kind, conversation_id, sender_id)
     )
     match = max(candidates, key=lambda candidate: candidate[0].specificity, default=None)
     if match is None:
@@ -180,27 +226,27 @@ def select_route(
 
 
 def validate_route(route: RouteInput, routes: list[Route], route_id: str, github_channels: set[str]) -> None:
-    # Equal-priority matches share the same source address. GitHub-only sources can be split by policy.
-    sources = {source.address for source in route.sources}
-
-    def overlaps(other: Route) -> bool:
-        common = sources.intersection(source.address for source in other.sources)
-        for channel, kind, _ in common:
-            if channel not in github_channels and kind not in GITHUB_KINDS:
+    def overlaps(left: Source, right: Source, other: RouteInput) -> bool:
+        if left.address != right.address:
+            return False
+        first, second = left.github_filter, right.github_filter
+        channel = left.channel_id
+        if channel in github_channels or left.kind in GITHUB_KINDS:
+            if first and second and not set(first.repositories).intersection(second.repositories):
+                return False
+            if first is None and second is None and left.repository is None:
                 return True
-            left, right = route.github_filter, other.github_filter
-            if (
-                left
-                and right
-                and set(left.repositories).intersection(right.repositories)
-                and set(left.users).intersection(right.users)
-            ):
-                return True
-        return False
+            return bool(route.github_users(left, channel) & other.github_users(right, channel))
+        left_users, right_users = route.allowed_users.get(channel), other.allowed_users.get(channel)
+        return left_users is None or right_users is None or bool(set(left_users).intersection(right_users))
 
-    conflict = next((other for other in routes if other.id != route_id and overlaps(other)), None)
-    if conflict:
-        raise ServiceError("conflict", f'A source already belongs to the route "{conflict.name}".')
+    if any(overlaps(left, right, route) for left, right in combinations(route.sources, 2)):
+        raise ServiceError("conflict", "Remove overlapping sources.")
+    for other in routes:
+        if other.id != route_id and any(
+            overlaps(left, right, other) for left in route.sources for right in other.sources
+        ):
+            raise ServiceError("conflict", f'A source already belongs to the route "{other.name}".')
 
 
 def enqueue(db: sqlite3.Connection, workspace_id: str, account_id: str, message: ChannelMessage) -> None:

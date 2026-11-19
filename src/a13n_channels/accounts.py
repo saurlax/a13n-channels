@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import sqlite3
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
@@ -11,10 +12,10 @@ from a13n_service.infra.crypto import Envelope, KeyRing, SecretLocation
 from a13n_service.infra.errors import ServiceError, not_found
 from a13n_service.infra.ids import new_object_id
 
-from a13n_channels.github import GITHUB_KINDS, GitHubBinding
+from a13n_channels.github import GITHUB_KINDS, LOGIN_PATTERN, GitHubBinding
 from a13n_channels.messages import ChannelMessage
 from a13n_channels.qq import QQCreate, QQSecret
-from a13n_channels.routing import SCHEMA, Route, RouteInput, enqueue, read_routes, validate_route
+from a13n_channels.routing import SCHEMA, Route, RouteInput, enqueue, github_channel_ids, read_routes, validate_route
 from a13n_channels.weixin import WeixinCredentials
 
 
@@ -136,30 +137,39 @@ class Accounts:
             previous = next((route for route in routes if route.id == route_id), None)
             if not create and previous is None:
                 raise not_found("channel_route", route_id)
-            github_channels = {
-                row["id"]
-                for row in db.execute("SELECT id FROM github_accounts WHERE workspace_id = ?", (workspace_id,))
-            }
-            if (
-                body.enabled
-                and body.github_filter is None
-                and any(source.channel_id in github_channels or source.kind in GITHUB_KINDS for source in body.sources)
+            github_channels = github_channel_ids(db, workspace_id)
+            if body.enabled and any(
+                source.github_filter is None
+                and (source.channel_id in github_channels or source.kind in GITHUB_KINDS)
+                and (source.repository is None or not body.allowed_users.get(source.channel_id))
+                for source in body.sources
             ):
                 raise ServiceError(
-                    "invalid_argument", "Set the GitHub repositories and allowed users.", {"field": "github_filter"}
+                    "invalid_argument",
+                    "Set the GitHub repositories in Sources and allowed users in Filters.",
+                    {"field": "github_filter"},
                 )
+            if any(
+                not re.fullmatch(LOGIN_PATTERN, user)
+                for channel_id in github_channels
+                for user in body.allowed_users.get(channel_id, [])
+            ):
+                raise ServiceError("invalid_argument", "Enter valid GitHub usernames.", {"field": "allowed_users"})
             validate_route(body, routes, route_id, github_channels)
-            for source in body.sources:
-                if (
-                    source.channel_id != "*"
-                    and not db.execute(
-                        """SELECT id FROM qq_accounts WHERE id = ? AND workspace_id = ?
+            for channel_id in {source.channel_id for source in body.sources} | body.allowed_users.keys():
+                if channel_id == "*":
+                    if channel_id in body.allowed_users:
+                        raise ServiceError("invalid_argument", "Choose an account for each allowed user.")
+                    continue
+                if not db.execute(
+                    """SELECT id FROM qq_accounts WHERE id = ? AND workspace_id = ?
                        UNION ALL SELECT id FROM weixin_accounts WHERE id = ? AND workspace_id = ?
                        UNION ALL SELECT id FROM github_accounts WHERE id = ? AND workspace_id = ?""",
-                        (source.channel_id, workspace_id) * 3,
-                    ).fetchone()
-                ):
+                    (channel_id, workspace_id) * 3,
+                ).fetchone():
                     raise ServiceError("invalid_argument", "Choose a channel in this workspace.")
+            if any(source.repository and source.channel_id not in github_channels for source in body.sources):
+                raise ServiceError("invalid_argument", "Choose a GitHub channel for a repository source.")
             destination_changed = previous is not None and (
                 previous.thread_policy != body.thread_policy or previous.fixed_thread_id != body.fixed_thread_id
             )
@@ -203,7 +213,7 @@ class Accounts:
                             "fixed_thread_id",
                             "multiparty_messages",
                             "wake_agent_id",
-                            "github_filter",
+                            "allowed_users",
                         }
                     ),
                     binding_id,
@@ -338,14 +348,9 @@ class Accounts:
         return {
             repository
             for route in await self.routes(account["workspace_id"])
-            if route.enabled
-            and route.principal_id
-            and route.github_filter
-            and any(
-                source.channel_id in {"*", account["id"]} and source.kind in {"*", *GITHUB_KINDS}
-                for source in route.sources
-            )
-            for repository in route.github_filter.repositories
+            if route.enabled and route.principal_id
+            for source in route.sources
+            for repository in route.github_repositories(source, account["id"])
         }
 
     async def receive_github(self, account: sqlite3.Row, message: ChannelMessage | None, cursor: str | None) -> None:

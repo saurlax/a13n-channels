@@ -409,6 +409,14 @@
   width: 25%;
 }
 
+.a13n-route-user-table col:nth-child(2) {
+  width: auto;
+}
+
+.a13n-route-user-table input {
+  width: 100%;
+}
+
 .a13n-route-source-table col.a13n-route-source-action {
   width: 40px;
 }
@@ -512,4 +520,19 @@
 
 .dark .a13n-channel-icon:is([data-platform="github"], [data-platform="github_app"]) {
   filter: brightness(0) invert(1);
+}
+
+
+.a13n-route-all-conversations {
+  display: flex;
+  align-items: center;
+  min-height: 36px;
+  color: var(--a13n-secondary);
+  font-size: var(--a13n-text-sm);
+}
+
+.a13n-route-section-header h3 {
+  margin: 0;
+  font-size: var(--a13n-text-sm);
+  font-weight: 600;
 }
