@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
@@ -15,6 +16,12 @@ from a13n_channels.accounts import Accounts
 from a13n_channels.delivery import Deliveries
 from a13n_channels.messages import ChannelMessage
 from a13n_channels.routing import RouteInput, Source, select_route
+
+
+def channel_input(message):
+    (part,) = message.payload.content
+    header, text = part.text.split("\n\nMessage:\n", 1)
+    return json.loads(header.removeprefix("Channel source: ")), text
 
 
 def store_for(tmp_path):
@@ -179,7 +186,8 @@ def test_matched_text_retries_same_submission_and_reuses_source_thread(
             assert message.agent_id == "ag_012345678901234567890123456789ab"
             assert message.delivery == "next_run"
             assert message.options.overrides.plugins[0].plugin_key == "saurlax.channels.delivery"
-            metadata = message.payload.content[1].value
+            metadata, text = channel_input(message)
+            assert text == f"prompt-{metadata['message_id']}"
             identifier = metadata["message_id"]
             invocation = (identifier, path, key, message)
             attempts.append(invocation)
@@ -291,7 +299,7 @@ def test_thread_destination_controls_reuse_and_queue_order(
         submissions = {}
 
         def accept(message, thread_id=None):
-            name = message.payload.content[1].value["message_id"]
+            name = channel_input(message)[0]["message_id"]
             target = thread_id or f"new-{name}"
             submissions[name] = target
             return SimpleNamespace(thread=SimpleNamespace(id=target), entry=SimpleNamespace(id=name)), True
@@ -424,7 +432,7 @@ def test_wake_filter_runs_before_the_main_agent(output, expected, tmp_path, monk
         if expected == "queued":
             await deliveries.advance((await jobs())[0], account, routes)
             assert submitted[1][0].agent_id == route.agent_id
-            assert submitted[1][0].payload.text() == group.text
+            assert channel_input(submitted[1][0])[1] == group.text
             assert submitted[1][1] != submitted[0][1]
             assert (await jobs())[0]["status"] == "submitted"
 

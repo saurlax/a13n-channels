@@ -1,6 +1,6 @@
 [project]
 name = "a13n-channels"
-version = "0.6.22"
+version = "0.6.23"
 description = "Channels"
 readme = "README.md"
 requires-python = ">=3.13"

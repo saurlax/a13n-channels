@@ -92,7 +92,7 @@ A specific conversation wins over a wildcard conversation. The next tie-breakers
 
 Saving authorizes the route to submit inputs under the saving user's identity. The plugin loads that person's current workspace grants for each delivery and uses only the read and run verbs. Losing either grant pauses delivery. Saving as a different user starts fresh Threads. Routes created by the previous HTTP-based implementation require one save to authorize in-process delivery. Remove its delivery URL and Runner key settings when upgrading.
 
-Each matched text message is submitted as ordinary user input with source metadata. The route selects one of four Thread policies:
+Each matched message is submitted as one user input containing its source metadata and text. Messages sent to a busy Thread queue for a separate Run. The route selects one of four Thread policies:
 
 | Policy | Thread scope |
 | --- | --- |
