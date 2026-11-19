@@ -1,8 +1,9 @@
-"""Workspace channel history and conversation-scoped delivery tools."""
+"""Workspace channel tools and conversation-scoped delivery tools."""
 
 from hashlib import sha256
 from typing import TYPE_CHECKING, Annotated
 
+import httpx
 from a13n_harness import AbstractHarnessPlugin
 from a13n_harness.context import AgentContext
 from a13n_harness.plugin_factories import HarnessPluginFactory, HarnessPluginFactoryContext
@@ -19,7 +20,7 @@ from pydantic_ai.capabilities import Capability
 from sqlalchemy import select
 
 from a13n_channels.messages import ChannelMessage, ReplyText, message_table
-from a13n_channels.qq import ChannelId
+from a13n_channels.qq import ChannelId, QQConnection, QQConversationKind
 from a13n_channels.routing import select_route
 
 if TYPE_CHECKING:
@@ -34,7 +35,7 @@ class ChannelToolSettings(BaseModel, extra="forbid"):
         default="",
         title="Allowed channels",
         max_length=8192,
-        description="Comma-separated channel account IDs. Leave blank to read all channels in this workspace.",
+        description="Comma-separated channel account IDs. Leave blank to allow all channels in this workspace.",
     )
 
     @field_validator("allowed_channels")
@@ -48,7 +49,7 @@ class ChannelToolSettings(BaseModel, extra="forbid"):
 class ChannelToolFactory(HarnessPluginFactory):
     configuration_model = ChannelToolSettings
     display_name = "Channels"
-    description = "Read incoming messages from allowed channels in the current workspace."
+    description = "Read channel history and send proactive QQ text messages."
 
     def __init__(self) -> None:
         self.channels: ChannelsRuntime | None = None
@@ -59,7 +60,7 @@ class ChannelToolFactory(HarnessPluginFactory):
 
     def create_plugin(self, context: HarnessPluginFactoryContext) -> AbstractHarnessPlugin:
         settings = ChannelToolSettings.model_validate(context.configuration)
-        return HistoryTools(context.plugin_id, self, frozenset(settings.allowed_channels.split(", ")) - {""})
+        return WorkspaceChannelTools(context.plugin_id, self, frozenset(settings.allowed_channels.split(", ")) - {""})
 
 
 class DeliveryToolSettings(BaseModel, extra="forbid"):
@@ -96,13 +97,6 @@ async def active_run(session, ctx: RunContext[AgentContext]):
     return run
 
 
-async def source_entry(session, run):
-    while run.trigger == "resume" and run.parent_run_id:
-        run = await session.get_one(RunRow, run.parent_run_id)
-    entry = await session.get(InboxEntryRow, run.source_entry_id) if run.source_entry_id else None
-    return entry if entry and entry.assigned_run_id == run.id else None
-
-
 async def read_messages(store, account, kind: str, conversation_id: str, limit: int, before_id: str | None = None):
     table = message_table(account["platform"])
     rows = await store.query(
@@ -131,7 +125,7 @@ async def read_messages(store, account, kind: str, conversation_id: str, limit: 
     ]
 
 
-class HistoryTools(AbstractHarnessPlugin):
+class WorkspaceChannelTools(AbstractHarnessPlugin):
     def __init__(self, plugin_id: str, factory: ChannelToolFactory, allowed: frozenset[str]) -> None:
         self._plugin_id = plugin_id
         self.factory = factory
@@ -149,19 +143,17 @@ class HistoryTools(AbstractHarnessPlugin):
                     Tool(self.channel_list_accounts),
                     Tool(self.channel_list_conversations),
                     Tool(self.channel_read_messages),
+                    Tool(self.channel_send_proactive),
                 ],
             )
         ]
 
-    async def accounts(self, ctx: RunContext[AgentContext]):
+    async def accounts(self, ctx: RunContext[AgentContext], *, sending: bool = False):
         active = self.factory.channels
         if active is None:
             raise ModelRetry("Channels is not configured on this Service.")
         async with short_session(active.host.storage) as session:
             run = await active_run(session, ctx)
-            entry = await source_entry(session, run)
-            if entry and (entry.request_key or "").startswith("channels-"):
-                raise ModelRetry("Use the originating conversation tools for a routed channel run.")
             scope = WorkspaceScope(run.organization_id, run.workspace_id)
             workspace = await session.get(WorkspaceRow, scope.workspace_id)
             organization = await session.get(OrganizationRow, scope.organization_id)
@@ -175,17 +167,20 @@ class HistoryTools(AbstractHarnessPlugin):
                 raise ModelRetry("Channels is unavailable in this workspace.")
             try:
                 actor = await principal_for(session, active.host.access, run.principal_id, confinement=scope)
-                authorize(actor, scope, "read", authority=ExecutionAuthority.model_validate(run.authority))
+                authority = ExecutionAuthority.model_validate(run.authority)
+                authorize(actor, scope, "read", authority=authority)
+                if sending:
+                    authorize(actor, scope, "run", authority=authority)
             except ServiceError as error:
                 raise ModelRetry(error.message) from None
         rows = await active.store.query(
-            """SELECT id, name, app_id, 'qq' AS platform FROM qq_accounts
-               WHERE workspace_id = ? AND organization_id = ?
+            """SELECT id, name, app_id, organization_id, app_secret, intents, 'qq' AS platform
+               FROM qq_accounts WHERE workspace_id = ? AND organization_id = ?
                UNION ALL
-               SELECT id, name, bot_id, 'weixin' FROM weixin_accounts
+               SELECT id, name, bot_id, organization_id, NULL, NULL, 'weixin' FROM weixin_accounts
                WHERE workspace_id = ? AND organization_id = ? AND bot_id IS NOT NULL
                UNION ALL
-               SELECT id, name, app_id, platform FROM github_accounts
+               SELECT id, name, app_id, organization_id, NULL, NULL, platform FROM github_accounts
                WHERE workspace_id = ? AND organization_id = ? ORDER BY name, id""",
             scope.workspace_id,
             scope.organization_id,
@@ -196,11 +191,11 @@ class HistoryTools(AbstractHarnessPlugin):
         )
         return active, {row["id"]: row for row in rows if not self.allowed or row["id"] in self.allowed}
 
-    async def account(self, ctx: RunContext[AgentContext], channel_id: str):
-        active, accounts = await self.accounts(ctx)
+    async def account(self, ctx: RunContext[AgentContext], channel_id: str, *, sending: bool = False):
+        active, accounts = await self.accounts(ctx, sending=sending)
         if channel_id not in accounts:
             raise ModelRetry("Choose an available channel ID from channel_list_accounts.")
-        return active.store, accounts[channel_id]
+        return active, accounts[channel_id]
 
     async def channel_list_accounts(self, ctx: RunContext[AgentContext]) -> list[dict]:
         """List channel account IDs and names available for reading in this workspace."""
@@ -211,12 +206,12 @@ class HistoryTools(AbstractHarnessPlugin):
         self, ctx: RunContext[AgentContext], channel_id: ChannelId, limit: Annotated[int, Field(ge=1, le=100)] = 30
     ) -> list[dict]:
         """List recent conversations for an allowed channel. Use the returned kind and conversation ID to read messages."""
-        store, account = await self.account(ctx, channel_id)
-        rows = await store.query(
+        active, account = await self.account(ctx, channel_id)
+        rows = await active.store.query(
             f"""SELECT json_extract(payload, '$.kind') AS kind,
                        json_extract(payload, '$.conversation_id') AS conversation_id,
                        max(json_extract(payload, '$.timestamp')) AS latest_at
-                FROM {account["platform"]}_messages WHERE channel_id = ? AND account_id = ?
+                FROM {message_table(account["platform"])} WHERE channel_id = ? AND account_id = ?
                 GROUP BY kind, conversation_id ORDER BY max(rowid) DESC LIMIT ?""",
             account["id"],
             account["app_id"],
@@ -234,8 +229,30 @@ class HistoryTools(AbstractHarnessPlugin):
         before_id: Annotated[str, Field(max_length=1024)] | None = None,
     ) -> list[dict]:
         """Read incoming text newest first. To read older messages, pass the last returned message ID as before_id."""
-        store, account = await self.account(ctx, channel_id)
-        return await read_messages(store, account, kind, conversation_id, limit, before_id)
+        active, account = await self.account(ctx, channel_id)
+        return await read_messages(active.store, account, kind, conversation_id, limit, before_id)
+
+    async def channel_send_proactive(
+        self,
+        ctx: RunContext[AgentContext],
+        channel_id: ChannelId,
+        kind: QQConversationKind,
+        conversation_id: Annotated[str, Field(min_length=1, max_length=512)],
+        text: ReplyText,
+    ) -> dict:
+        """Send text to a QQ conversation without a source message, for example from a scheduled run."""
+        active, account = await self.account(ctx, channel_id, sending=True)
+        if account["platform"] != "qq":
+            return {"status": "unsupported", "reason": "Proactive text sending is supported for QQ."}
+        qq = QQConnection(active.http, channel_id, active.store.credentials(account))
+        try:
+            message_id = await qq.send_proactive(kind, conversation_id, text)
+        except httpx.HTTPStatusError as error:
+            code = error.response.status_code
+            return {"status": "rejected" if code < 500 else "unknown", "http_status": code}
+        except (httpx.RequestError, ValueError, KeyError, TypeError):
+            return {"status": "unknown"}
+        return {"status": "sent", "message_id": message_id}
 
 
 class ChannelTools(AbstractHarnessPlugin):

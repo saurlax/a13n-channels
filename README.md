@@ -112,20 +112,21 @@ Channel delivery adds two Harness tools to the target Agent for that run:
 
 When a Run receives multiple channel messages, pass the intended message ID to the tools to select its conversation. Assistant text stays in Console. A channel reply requires a send tool call. The tools resolve the conversation from the run's delivery record and require a currently enabled route and account. They are available to the target Agent during channel delivery. Failed deliveries and unconfirmed sends appear in route status. A replay of the same send call never resends an unconfirmed reply.
 
-### Read history from a Console conversation
+### Read history and send proactive QQ messages
 
-In the Agent editor, open **Advanced → Plugins → Add plugin**, choose **Channels**, and publish the Agent configuration. Set **Allowed channels** to a comma-separated list of channel account IDs, or leave it blank to read all channel accounts in the current workspace. Use the Channels App's account IDs. The **Channels Delivery** plugin is loaded automatically by routes.
+In the Agent editor, open **Advanced → Plugins → Add plugin**, choose **Channels**, and publish the Agent configuration. Set **Allowed channels** to a comma-separated list of channel account IDs, or leave it blank to allow all channel accounts in the current workspace for the active tools. Use the Channels App's account IDs. The **Channels Delivery** plugin is loaded automatically by routes.
 
 - `channel_list_accounts` lists readable channel accounts.
 - `channel_list_conversations` lists recent conversations for one account.
 - `channel_read_messages` reads incoming text from a selected conversation. Pass the last returned message ID as `before_id` to page backward.
+- `channel_send_proactive` sends up to 2,000 characters to a QQ conversation without an incoming message. Pass the channel account ID, conversation kind, and conversation ID. QQ applies its platform permissions and delivery limits.
 
-These tools require workspace read access. Routed runs use the original conversation's tools and reply context.
+The configured Channels tools are available in regular, scheduled, and routed runs with workspace read access. Proactive sends additionally require workspace run access. Routed runs also receive the Channels Delivery tools for replying to the original conversation.
 
 ## Where to make changes
 
 - `src/a13n_channels/app.py` registers the workspace account and routing APIs. `routing.py` matches sources, `delivery.py` submits inputs, and `tools.py` implements the conversation tools.
-- `src/a13n_channels/qq.py` implements QQ authentication, WebSocket handling, and passive replies. `src/a13n_channels/accounts.py` owns account and message storage.
+- `src/a13n_channels/qq.py` implements QQ authentication, WebSocket handling, text replies, and proactive sends. `src/a13n_channels/accounts.py` owns account and message storage.
 - `frontend/src/index.tsx` mounts the Channels page in Console. App requests and cache keys are scoped by the host bridge.
 - `pyproject.toml` owns entry-point discovery and wheel/sdist asset packaging.
 

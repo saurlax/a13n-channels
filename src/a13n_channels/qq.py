@@ -6,7 +6,7 @@ import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -29,6 +29,9 @@ MESSAGE_TYPES = {
     "DIRECT_MESSAGE_CREATE": ("guild_dm", "id", "guild_id"),
 }
 QQ_CONVERSATION_KINDS = tuple(dict.fromkeys(kind for kind, _, _ in MESSAGE_TYPES.values()))
+
+type QQConversationKind = Literal["private", "group", "guild", "guild_dm"]
+
 
 type ChannelId = Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]{1,128}$")]
 type AppId = Annotated[str, Field(pattern=r"^[A-Za-z0-9_.:@-]{1,128}$")]
@@ -118,13 +121,20 @@ class QQConnection:
         return self.token
 
     async def reply(self, incoming: ChannelMessage, text: str, sequence: int) -> str:
+        return await self._send_message(
+            incoming.kind, incoming.conversation_id, {"content": text, "msg_id": incoming.id, "msg_seq": sequence}
+        )
+
+    async def send_proactive(self, kind: QQConversationKind, conversation_id: str, text: str) -> str:
+        return await self._send_message(kind, conversation_id, {"content": text})
+
+    async def _send_message(self, kind: str, conversation_id: str, body: dict[str, str | int]) -> str:
         token = await self._access_token()
-        target = quote(incoming.conversation_id, safe="")
-        body = {"content": text, "msg_id": incoming.id, "msg_seq": sequence}
-        if incoming.kind in {"private", "group"}:
+        target = quote(conversation_id, safe="")
+        if kind in {"private", "group"}:
             body["msg_type"] = 0
         response = await self.http.post(
-            f"{QQ_API}{MESSAGE_PATHS[incoming.kind]}/{target}/messages",
+            f"{QQ_API}{MESSAGE_PATHS[kind]}/{target}/messages",
             headers={"Authorization": f"QQBot {token}"},
             json=body,
         )

@@ -260,9 +260,7 @@ class Deliveries:
                 self.runtime.storage, actor, job["workspace_id"], agent.id, agent.default_revision_id
             )
             plugins = [
-                p.model_dump(mode="json")
-                for p in revision.config.plugins
-                if p.plugin_key not in {FACTORY_KEY, DELIVERY_FACTORY_KEY}
+                p.model_dump(mode="json") for p in revision.config.plugins if p.plugin_key != DELIVERY_FACTORY_KEY
             ]
             used_names = {plugin["instance_name"] for plugin in plugins}
             instance_name = DELIVERY_FACTORY_KEY

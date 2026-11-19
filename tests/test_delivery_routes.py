@@ -546,24 +546,34 @@ def test_channel_tools_use_trusted_delivery_and_do_not_repeat_a_send(tmp_path, m
     asyncio.run(exercise())
 
 
-def test_history_tools_filter_accounts_and_read_only_the_selected_conversation(tmp_path, monkeypatch):
+def test_workspace_channel_tools_share_the_account_allowlist_for_reads_and_scheduled_sends(tmp_path, monkeypatch):
+    import json
+
+    import httpx
     from pydantic_ai import ModelRetry
 
     from a13n_channels import tools
+    from a13n_channels.qq import QQCreate
 
     async def exercise():
         store = store_for(tmp_path)
         await store.initialize()
         for channel, workspace in (("channel", "workspace"), ("another", "workspace"), ("foreign", "other")):
+            credentials = QQCreate(name=channel, app_id=channel, app_secret="test-secret")
             await store.query(
-                "INSERT INTO qq_accounts VALUES (?, 'org', ?, ?, ?, 'credentials', 1)",
+                "INSERT INTO qq_accounts VALUES (?, 'org', ?, ?, ?, ?, 1)",
                 channel,
                 workspace,
                 channel,
                 channel,
+                store.encrypt("org", channel, credentials),
             )
+        generation = (await store.query("SELECT app_secret FROM qq_accounts WHERE id = 'channel'"))[0]["app_secret"]
+        await store.query(
+            "INSERT INTO github_accounts VALUES ('gh', 'org', 'workspace', 'GitHub', 'github_app', 'app', 'secret', '')"
+        )
         for message_id, conversation in (("first", "one"), ("other-chat", "two"), ("latest", "one")):
-            await store.receive(incoming(message_id, conversation), "credentials")
+            await store.receive(incoming(message_id, conversation), generation)
 
         run = SimpleNamespace(
             id="run",
@@ -572,23 +582,20 @@ def test_history_tools_filter_accounts_and_read_only_the_selected_conversation(t
             principal_id="owner",
             organization_id="org",
             workspace_id="workspace",
-            trigger="input",
-            source_entry_id="entry",
+            trigger="schedule",
             authority={
                 "principal_id": "owner",
                 "organization_id": "org",
                 "workspace_id": "workspace",
-                "verbs": ["read"],
+                "verbs": ["read", "run"],
             },
         )
         organization = SimpleNamespace(settings={"app_plugins": {"enabled": [tools.FACTORY_KEY]}})
-        entry = SimpleNamespace(assigned_run_id="run", request_key=None)
 
         class Session:
             async def get(self, model, _id):
                 return {
                     tools.RunRow: run,
-                    tools.InboxEntryRow: entry,
                     tools.OrganizationRow: organization,
                     tools.WorkspaceRow: SimpleNamespace(organization_id="org", archived_at=None),
                 }[model]
@@ -598,13 +605,24 @@ def test_history_tools_filter_accounts_and_read_only_the_selected_conversation(t
             yield Session()
 
         async def principal(_session, _access, principal_id, *, confinement):
-            return Principal(principal_id, "user", (Grant("org", "workspace", frozenset({"read"})),), confinement)
+            return Principal(
+                principal_id, "user", (Grant("org", "workspace", frozenset({"read", "run"})),), confinement
+            )
+
+        messages = []
+
+        def qq(request):
+            if request.url.path == "/app/getAppAccessToken":
+                return httpx.Response(200, json={"access_token": "test-token", "expires_in": 60})
+            messages.append((request.url.path, json.loads(request.content)))
+            return httpx.Response(200, json={"id": "sent-qq"})
 
         monkeypatch.setattr(tools, "short_session", session)
         monkeypatch.setattr(tools, "principal_for", principal)
         factory = tools.ChannelToolFactory()
-        factory.channels = SimpleNamespace(host=SimpleNamespace(storage=None, access=None), store=store)
-        plugin = tools.HistoryTools("channels", factory, frozenset({"channel", "foreign"}))
+        http = httpx.AsyncClient(transport=httpx.MockTransport(qq))
+        factory.channels = SimpleNamespace(host=SimpleNamespace(storage=None, access=None), store=store, http=http)
+        plugin = tools.WorkspaceChannelTools("channels", factory, frozenset({"channel", "foreign"}))
         ctx = SimpleNamespace(
             deps=SimpleNamespace(
                 instance=SimpleNamespace(
@@ -629,11 +647,37 @@ def test_history_tools_filter_accounts_and_read_only_the_selected_conversation(t
         for channel in ("another", "foreign"):
             with pytest.raises(ModelRetry, match="available channel"):
                 await plugin.channel_read_messages(ctx, channel, "private", "one")
-        all_channels = tools.HistoryTools("channels", factory, frozenset())
-        assert {row["id"] for row in await all_channels.channel_list_accounts(ctx)} == {"channel", "another"}
+        all_channels = tools.WorkspaceChannelTools("channels", factory, frozenset())
+        assert {row["id"] for row in await all_channels.channel_list_accounts(ctx)} == {"channel", "another", "gh"}
+        assert await all_channels.channel_list_conversations(ctx, "gh") == []
+        assert (await all_channels.channel_send_proactive(ctx, "gh", "private", "one", "alert"))["status"] == (
+            "unsupported"
+        )
+        run.authority["verbs"] = ["read"]
+        with pytest.raises(ModelRetry, match="delegation"):
+            await all_channels.channel_send_proactive(ctx, "channel", "private", "one", "alert")
+        run.authority["verbs"] = ["read", "run"]
+        for channel in ("another", "foreign"):
+            with pytest.raises(ModelRetry, match="available channel"):
+                await plugin.channel_send_proactive(ctx, channel, "private", "unseen-recipient", "alert")
+        assert await plugin.channel_send_proactive(ctx, "channel", "private", "unseen-recipient", "alert") == {
+            "status": "sent",
+            "message_id": "sent-qq",
+        }
+        assert await all_channels.channel_send_proactive(ctx, "another", "group", "group-id", "alert") == {
+            "status": "sent",
+            "message_id": "sent-qq",
+        }
+        assert messages == [
+            ("/v2/users/unseen-recipient/messages", {"content": "alert", "msg_type": 0}),
+            ("/v2/groups/group-id/messages", {"content": "alert", "msg_type": 0}),
+        ]
         organization.settings = {}
         with pytest.raises(ModelRetry, match="unavailable"):
-            await plugin.channel_list_accounts(ctx)
+            await all_channels.channel_list_accounts(ctx)
+        with pytest.raises(ModelRetry, match="unavailable"):
+            await all_channels.channel_send_proactive(ctx, "channel", "private", "one", "alert")
+        await http.aclose()
 
     asyncio.run(exercise())
 
