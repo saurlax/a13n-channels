@@ -104,11 +104,15 @@ Channel delivery adds two Harness tools to the target Agent for that run:
 
 Assistant text stays in Console. A channel reply requires a send tool call. The tools resolve the conversation from the run's delivery record and require a currently enabled route and account. They are available to the target Agent during channel delivery. Failed deliveries and unconfirmed sends appear in route status. A replay of the same send call never resends an unconfirmed reply.
 
-### Proposed Agent read access
+### Read history from a Console conversation
 
-The proposed workflow for reading channel history from ordinary Console conversations is to add **Channels** under **Advanced → Plugins** in the Agent editor and configure **Allowed channels**. An empty selection would allow reads from all channel accounts in the current workspace. Selecting accounts would limit reads to those accounts.
+In the Agent editor, open **Advanced → Plugins → Add plugin**, choose **Channels**, and publish the Agent configuration. Set **Allowed channels** to a comma-separated list of channel account IDs, or leave it blank to read all channel accounts in the current workspace. Use the Channels App's account IDs. The **Channels Delivery** plugin is loaded automatically by routes.
 
-This setting is planned. The current tools require a channel-triggered run and scope both reading and sending to its originating conversation.
+- `channel_list_accounts` lists readable channel accounts.
+- `channel_list_conversations` lists recent conversations for one account.
+- `channel_read_messages` reads incoming text from a selected conversation. Pass the last returned message ID as `before_id` to page backward.
+
+These tools require workspace read access. Routed runs use the original conversation's tools and reply context.
 
 ## Where to make changes
 

@@ -178,7 +178,7 @@ def test_matched_text_retries_same_submission_and_reuses_source_thread(
             assert allowed_verbs(actor, actor.confinement) == {"read", "run"}
             assert message.agent_id == "ag_012345678901234567890123456789ab"
             assert message.delivery == "next_run"
-            assert message.options.overrides.plugins[0].plugin_key == "saurlax.channels"
+            assert message.options.overrides.plugins[0].plugin_key == "saurlax.channels.delivery"
             metadata = message.payload.content[1].value
             identifier = metadata["message_id"]
             invocation = (identifier, path, key, message)
@@ -521,5 +521,97 @@ def test_channel_tools_use_trusted_delivery_and_do_not_repeat_a_send(tmp_path, m
         entry.request_key = "channels-fabricated"
         with pytest.raises(ModelRetry, match="no longer active"):
             await plugin.channel_send_message(ctx, "reply")
+
+    asyncio.run(exercise())
+
+
+def test_history_tools_filter_accounts_and_read_only_the_selected_conversation(tmp_path, monkeypatch):
+    from pydantic_ai import ModelRetry
+
+    from a13n_channels import tools
+
+    async def exercise():
+        store = store_for(tmp_path)
+        await store.initialize()
+        for channel, workspace in (("channel", "workspace"), ("another", "workspace"), ("foreign", "other")):
+            await store.query(
+                "INSERT INTO qq_accounts VALUES (?, 'org', ?, ?, ?, 'credentials', 1)",
+                channel,
+                workspace,
+                channel,
+                channel,
+            )
+        for message_id, conversation in (("first", "one"), ("other-chat", "two"), ("latest", "one")):
+            await store.receive(incoming(message_id, conversation), "credentials")
+
+        run = SimpleNamespace(
+            id="run",
+            status="running",
+            current_attempt_id="attempt",
+            principal_id="owner",
+            organization_id="org",
+            workspace_id="workspace",
+            trigger="input",
+            source_entry_id="entry",
+            authority={
+                "principal_id": "owner",
+                "organization_id": "org",
+                "workspace_id": "workspace",
+                "verbs": ["read"],
+            },
+        )
+        organization = SimpleNamespace(settings={"app_plugins": {"enabled": [tools.FACTORY_KEY]}})
+        entry = SimpleNamespace(assigned_run_id="run", request_key=None)
+
+        class Session:
+            async def get(self, model, _id):
+                return {
+                    tools.RunRow: run,
+                    tools.InboxEntryRow: entry,
+                    tools.OrganizationRow: organization,
+                    tools.WorkspaceRow: SimpleNamespace(organization_id="org", archived_at=None),
+                }[model]
+
+        @asynccontextmanager
+        async def session(_storage):
+            yield Session()
+
+        async def principal(_session, _access, principal_id, *, confinement):
+            return Principal(principal_id, "user", (Grant("org", "workspace", frozenset({"read"})),), confinement)
+
+        monkeypatch.setattr(tools, "short_session", session)
+        monkeypatch.setattr(tools, "principal_for", principal)
+        factory = tools.ChannelToolFactory()
+        factory.channels = SimpleNamespace(host=SimpleNamespace(storage=None, access=None), store=store)
+        plugin = tools.HistoryTools("channels", factory, frozenset({"channel", "foreign"}))
+        ctx = SimpleNamespace(
+            deps=SimpleNamespace(
+                instance=SimpleNamespace(
+                    identity=SimpleNamespace(issuer="a13n-service", subject="owner"),
+                    agent_instance_id="run",
+                    host_refs={"run_id": "run", "attempt_id": "attempt"},
+                )
+            )
+        )
+        assert await plugin.channel_list_accounts(ctx) == [{"id": "channel", "name": "channel", "platform": "qq"}]
+        assert [row["conversation_id"] for row in await plugin.channel_list_conversations(ctx, "channel")] == [
+            "one",
+            "two",
+        ]
+        assert [row["id"] for row in await plugin.channel_read_messages(ctx, "channel", "private", "one", limit=1)] == [
+            "latest"
+        ]
+        assert [
+            row["id"]
+            for row in await plugin.channel_read_messages(ctx, "channel", "private", "one", before_id="latest")
+        ] == ["first"]
+        for channel in ("another", "foreign"):
+            with pytest.raises(ModelRetry, match="available channel"):
+                await plugin.channel_read_messages(ctx, channel, "private", "one")
+        all_channels = tools.HistoryTools("channels", factory, frozenset())
+        assert {row["id"] for row in await all_channels.channel_list_accounts(ctx)} == {"channel", "another"}
+        organization.settings = {}
+        with pytest.raises(ModelRetry, match="unavailable"):
+            await plugin.channel_list_accounts(ctx)
 
     asyncio.run(exercise())

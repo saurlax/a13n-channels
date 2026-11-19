@@ -84,7 +84,7 @@ def test_qq_accounts_and_messages_are_owned_by_the_workspace(tmp_path, monkeypat
         settings=settings,
         keys=keys,
         tasks=Tasks(),
-        plugins=build_harness_plugin_factory_catalog(plugin_keys=(app.APP_ID,)),
+        plugins=build_harness_plugin_factory_catalog(plugin_keys=(app.APP_ID, "saurlax.channels.delivery")),
     )
     endpoints = {route.name: route.endpoint for route in definition.routers[0].routes}
 

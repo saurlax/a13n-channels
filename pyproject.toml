@@ -1,6 +1,6 @@
 [project]
 name = "a13n-channels"
-version = "0.6.13"
+version = "0.6.14"
 description = "Channels"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -11,6 +11,7 @@ dependencies = ["a13n-service", "httpx>=0.28,<1", "websockets>=15,<16", "qrcode>
 
 [project.entry-points."a13n_harness.plugins"]
 "saurlax.channels" = "a13n_channels.tools:ChannelToolFactory"
+"saurlax.channels.delivery" = "a13n_channels.tools:DeliveryToolFactory"
 
 [build-system]
 requires = ["hatchling>=1.27,<2"]

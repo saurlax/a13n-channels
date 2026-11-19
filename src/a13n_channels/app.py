@@ -36,7 +36,7 @@ from a13n_channels.messages import ChannelMessage, TextReply
 from a13n_channels.qq import AppId, ChannelId, QQAccount, QQConnection, QQCreate, QQSecret
 from a13n_channels.qq_pairing import LoginId, QQScan, QQScanCredentials, QQScans, QQScanSave, QQScanStatus
 from a13n_channels.routing import RouteInput
-from a13n_channels.tools import FACTORY_KEY, ChannelToolFactory
+from a13n_channels.tools import DELIVERY_FACTORY_KEY, FACTORY_KEY, ChannelToolFactory
 from a13n_channels.weixin import (
     LoginRequired,
     Pairing,
@@ -271,9 +271,10 @@ def definition() -> AppDefinition:
             await store.initialize()
             async with httpx.AsyncClient(timeout=15, follow_redirects=False, trust_env=False) as http:
                 active = ChannelsRuntime(runtime, store, http)
-                factory = runtime.plugins.require(FACTORY_KEY)
-                assert isinstance(factory, ChannelToolFactory)
-                factory.channels = active
+                factories = [runtime.plugins.require(key) for key in (FACTORY_KEY, DELIVERY_FACTORY_KEY)]
+                for factory in factories:
+                    assert isinstance(factory, ChannelToolFactory)
+                    factory.channels = active
                 channels = active
                 supervisor = runtime.tasks.start(active.serve(), name="channels-listeners", service=True)
                 delivery = runtime.tasks.start(
@@ -285,7 +286,8 @@ def definition() -> AppDefinition:
                 try:
                     yield
                 finally:
-                    factory.channels = None
+                    for factory in factories:
+                        factory.channels = None
                     channels = None
                     for task in tasks:
                         task.cancel()
@@ -918,7 +920,7 @@ def definition() -> AppDefinition:
     return AppDefinition(
         app_id=APP_ID,
         name="Channels",
-        factory_keys=frozenset({FACTORY_KEY}),
+        factory_keys=frozenset({FACTORY_KEY, DELIVERY_FACTORY_KEY}),
         routers=(router,),
         settings={SETTINGS: ChannelsSettings},
         startup=startup,

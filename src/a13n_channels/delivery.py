@@ -25,7 +25,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from a13n_channels.accounts import Accounts
 from a13n_channels.messages import ChannelMessage
 from a13n_channels.routing import Route, select_route
-from a13n_channels.tools import FACTORY_KEY
+from a13n_channels.tools import DELIVERY_FACTORY_KEY, FACTORY_KEY
 
 log = logging.getLogger(__name__)
 
@@ -261,12 +261,16 @@ class Deliveries:
             revision = await agents.get_revision(
                 self.runtime.storage, actor, job["workspace_id"], agent.id, agent.default_revision_id
             )
-            plugins = [p.model_dump(mode="json") for p in revision.config.plugins if p.plugin_key != FACTORY_KEY]
+            plugins = [
+                p.model_dump(mode="json")
+                for p in revision.config.plugins
+                if p.plugin_key not in {FACTORY_KEY, DELIVERY_FACTORY_KEY}
+            ]
             used_names = {plugin["instance_name"] for plugin in plugins}
-            instance_name = FACTORY_KEY
+            instance_name = DELIVERY_FACTORY_KEY
             while instance_name in used_names:
                 instance_name += "_"
-            plugins.append({"plugin_key": FACTORY_KEY, "instance_name": instance_name})
+            plugins.append({"plugin_key": DELIVERY_FACTORY_KEY, "instance_name": instance_name})
             body["agent_revision_id"] = revision.id
             body["options"] = {"overrides": {"plugins": plugins}}
             if thread_id is None:

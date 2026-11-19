@@ -105,7 +105,7 @@ def test_weixin_pairing_and_text_exchange(monkeypatch, tmp_path):
         settings=settings,
         keys=keys,
         tasks=Tasks(),
-        plugins=build_harness_plugin_factory_catalog(plugin_keys=(app.APP_ID,)),
+        plugins=build_harness_plugin_factory_catalog(plugin_keys=(app.APP_ID, "saurlax.channels.delivery")),
     )
     endpoints = {route.name: route.endpoint for route in definition.routers[0].routes}
 

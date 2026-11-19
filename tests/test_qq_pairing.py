@@ -64,7 +64,7 @@ def test_qq_scan_saves_credentials_only_for_the_initiating_workspace_and_actor(t
         settings=SimpleNamespace(extensions={"channels": settings}),
         keys=keys,
         tasks=Tasks(),
-        plugins=build_harness_plugin_factory_catalog(plugin_keys=(app.APP_ID,)),
+        plugins=build_harness_plugin_factory_catalog(plugin_keys=(app.APP_ID, "saurlax.channels.delivery")),
     )
     definition = app.definition()
     endpoints = {route.name: route.endpoint for route in definition.routers[0].routes}
