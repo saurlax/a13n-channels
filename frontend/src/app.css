@@ -1,3 +1,15 @@
+.a13n-channel-icon-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.a13n-channel-icon {
+  width: 16px;
+  height: 16px;
+  flex: none;
+}
+
 .a13n-qq-list {
   container-type: inline-size;
   min-width: 0;

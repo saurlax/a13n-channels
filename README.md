@@ -121,4 +121,6 @@ These tools require workspace read access. Routed runs use the original conversa
 - `frontend/src/index.tsx` mounts the Channels page in Console. App requests and cache keys are scoped by the host bridge.
 - `pyproject.toml` owns entry-point discovery and wheel/sdist asset packaging.
 
+The WeChat icon is adapted from [Simple Icons](https://simpleicons.org/) (CC0).
+
 See [AGENTS.md](AGENTS.md) for project boundaries and Conventional Commit guidance.

@@ -2,6 +2,7 @@ import {
   React, ApiError, Button, ChoiceField, Empty, ErrorPage, Input, Link, Loading, Page, Switch,
   useAccess, useApp, useNavigate, useQuery, useQueryClient, useTranslation,
 } from "@a13n/console";
+import { ChannelIcon, type Platform } from "./channel-icon";
 import { ChannelSelect } from "./select";
 
 const english = {
@@ -76,7 +77,7 @@ const chinese: typeof english = {
   error: "操作未完成。请检查路由来源和目标 Agent。",
 };
 
-type Account = { id: string; name: string; platform: "qq" | "weixin" };
+type Account = { id: string; name: string; platform: Platform };
 type Agent = { id: string; name: string };
 type Source = { channel_id: string; kind: string; conversation_id: string; mentions_only?: boolean };
 type MultipartyFilter = "all" | "mentions";
@@ -164,7 +165,9 @@ function SourceEditor({ source, accounts, update, remove, text, disabled }: {
           placeholder={text.selectChannel}
           options={[
             { value: "*", label: text.anyChannel },
-            ...accounts.map(item => ({ value: item.id, label: item.name })),
+            ...accounts.map(item => ({
+              value: item.id, label: item.name, icon: <ChannelIcon platform={item.platform} />,
+            })),
             ...(source.channel_id && source.channel_id !== "*" && !account
               ? [{ value: source.channel_id, label: `${text.missing} (${source.channel_id})` }] : []),
           ]}

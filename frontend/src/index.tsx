@@ -2,6 +2,7 @@ import {
   React, Button, Empty, ErrorPage, Input, Link, Loading, Page,
   useAccess, useApp, useQuery, useQueryClient, useParams, useSearchParams, useTranslation,
 } from "@a13n/console";
+import { ChannelIcon, type Platform } from "./channel-icon";
 import { RoutePage } from "./routes";
 import { ChannelSelect } from "./select";
 import "./app.css";
@@ -27,7 +28,7 @@ const english = {
 
 const chinese: typeof english = {
   title: "渠道", add: "添加渠道", name: "名称", secret: "AppSecret",
-  channelType: "渠道类型", qq: "QQ机器人", weixin: "微信ClawBot", status: "状态",
+  channelType: "渠道类型", qq: "QQ 机器人", weixin: "微信 ClawBot", status: "状态",
   secretPlaceholder: "留空则保留现有 AppSecret", remove: "删除", cancel: "取消", save: "保存",
   empty: "暂无渠道", unconfigured: "尚未配置渠道存储。",
   deleteTitle: "删除渠道",
@@ -44,7 +45,6 @@ const chinese: typeof english = {
   reconnecting: "重连中", errorState: "连接异常", unknown: "未知",
 };
 
-type Platform = "qq" | "weixin";
 type Account = { id: string; name: string; platform: Platform; account_id: string | null; state: string };
 type Pairing = { login_id: string; qr_image: string; status: string };
 type QQScan = { login_id: string; qr_image: string | null; status: "wait" | "confirmed" | "expired" | "failed" };
@@ -85,7 +85,9 @@ function ChannelEditorHeader({ account, text, titleId }: {
   return (
     <header className="a13n-channel-edit-header">
       <h2 id={titleId}>{account.name}</h2>
-      <p id={`${titleId}-description`}>{text[account.platform]}</p>
+      <p id={`${titleId}-description`} className="a13n-channel-icon-label">
+        <ChannelIcon platform={account.platform} />{text[account.platform]}
+      </p>
     </header>
   );
 }
@@ -304,7 +306,10 @@ function AccountDialog({ action, text, dismiss, pair, requestDelete, qqScanAvail
           <label htmlFor={`${titleId}-platform`}>{text.channelType}
             <ChannelSelect id={`${titleId}-platform`} label={text.channelType} container={dialog}
               value={platform} disabled={pending || testing}
-              options={[{ value: "qq", label: text.qq }, { value: "weixin", label: text.weixin }]}
+              options={[
+                { value: "qq", label: text.qq, icon: <ChannelIcon platform="qq" /> },
+                { value: "weixin", label: text.weixin, icon: <ChannelIcon platform="weixin" /> },
+              ]}
               onChange={value => { setConnection("idle"); setPlatform(value); }} />
           </label>
           <label>{text.name}<Input name="name" required maxLength={80} disabled={pending} /></label>
@@ -538,7 +543,11 @@ function Channels({ nav }: { nav: React.ReactNode }) {
                     <strong title={account.name}>{account.name}</strong>
                     {account.account_id && <small title={account.account_id}>{account.account_id}</small>}
                   </th>
-                  <td role="cell" data-label={text.channelType}>{text[account.platform]}</td>
+                  <td role="cell" data-label={text.channelType}>
+                    <span className="a13n-channel-icon-label">
+                      <ChannelIcon platform={account.platform} />{text[account.platform]}
+                    </span>
+                  </td>
                   <td role="cell" data-label={text.status}>
                     <ChannelStatus state={account.state} text={text} />
                   </td>
