@@ -5,9 +5,12 @@ import json
 
 import httpx
 import pytest
+from pydantic_ai import Tool
+from pydantic_ai.profiles.google import GoogleJsonSchemaTransformer, GoogleOpenAPISchemaTransformer
 
 from a13n_channels import qq
-from a13n_channels.qq_content import QQCard, QQMarkdown, QQMedia, QQReply, open_attachment
+from a13n_channels.qq_content import QQArk, QQMarkdown, QQMedia, QQReply, open_attachment
+from a13n_channels.tools import ChannelToolFactory, ChannelTools
 
 PNG = b"\x89PNG\r\n\x1a\npayload"
 STICKER = "https://grouptalk.c2c.qq.com/sticker?rkey=private"
@@ -38,6 +41,15 @@ def connection(client):
 
 def token_response():
     return httpx.Response(200, json={"access_token": "test-token", "expires_in": 60})
+
+
+@pytest.mark.parametrize("transformer", [GoogleJsonSchemaTransformer, GoogleOpenAPISchemaTransformer])
+def test_gemini_tool_schema_keeps_native_qq_card_and_button_fields(transformer):
+    plugin = ChannelTools("channels", ChannelToolFactory())
+    schema = transformer(Tool(plugin.channel_send_message).function_schema.json_schema).walk()
+    rendered = json.dumps(schema)
+    for field in ("specify_user_ids", "render_data", "obj_kv", "template_id", "thumbnail"):
+        assert f'"{field}"' in rendered
 
 
 def test_qq_projects_attachments_stickers_forwarded_records_quotes_and_cards():
@@ -301,7 +313,7 @@ def test_qq_sends_cards_markdown_buttons_guild_images_and_interaction_replies():
                 event_reply_id=event.event_reply_id,
             )
             await bot.reply(
-                incoming(), None, 2, rich=QQCard(type="ark", card={"template_id": 23, "kv": []}), reference_id="quote"
+                incoming(), None, 2, rich=QQArk(type="ark", card={"template_id": 23, "kv": []}), reference_id="quote"
             )
             await bot.reply(
                 incoming().model_copy(update={"kind": "guild"}),

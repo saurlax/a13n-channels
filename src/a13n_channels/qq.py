@@ -22,7 +22,8 @@ from a13n_channels.messages import ChannelMessage
 from a13n_channels.qq_content import (
     MEDIA_LIMITS,
     MEDIA_TYPES,
-    QQCard,
+    QQArk,
+    QQEmbed,
     QQInbound,
     QQMarkdown,
     QQMedia,
@@ -350,7 +351,7 @@ class QQConnection:
             if rich.keyboard is not None:
                 body["keyboard"] = rich.keyboard
             message_type = 2
-        elif isinstance(rich, QQCard):
+        elif isinstance(rich, (QQArk, QQEmbed)):
             body[rich.type] = rich.card
             message_type = 3 if rich.type == "ark" else 4
         elif isinstance(rich, QQMedia):

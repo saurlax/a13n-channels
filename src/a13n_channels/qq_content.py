@@ -8,7 +8,7 @@ import re
 import socket
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from typing import Annotated, Literal
+from typing import Annotated, Literal, NotRequired, TypedDict
 from urllib.parse import parse_qs, urljoin, urlsplit
 
 import httpx
@@ -313,12 +313,56 @@ class QQMarkdownParameter(BaseModel, extra="forbid"):
     values: list[Annotated[str, Field(max_length=4096)]] = Field(min_length=1, max_length=32)
 
 
+class QQButtonPermission(TypedDict):
+    type: int
+    specify_user_ids: NotRequired[list[str]]
+    specify_role_ids: NotRequired[list[str]]
+
+
+class QQButtonAction(TypedDict):
+    type: int
+    permission: QQButtonPermission
+    data: str
+    unsupport_tips: NotRequired[str]
+    reply: NotRequired[bool]
+    enter: NotRequired[bool]
+    anchor: NotRequired[int]
+    click_limit: NotRequired[int]
+    at_bot_show_channel_list: NotRequired[bool]
+
+
+class QQButtonLabel(TypedDict):
+    label: str
+    visited_label: str
+    style: int
+
+
+class QQButton(TypedDict):
+    id: str
+    render_data: QQButtonLabel
+    action: QQButtonAction
+    group_id: NotRequired[str]
+
+
+class QQKeyboardRow(TypedDict):
+    buttons: Annotated[list[QQButton], Field(min_length=1, max_length=5)]
+
+
+class QQKeyboardContent(TypedDict):
+    rows: Annotated[list[QQKeyboardRow], Field(min_length=1, max_length=5)]
+
+
+class QQKeyboard(TypedDict, total=False):
+    id: Annotated[str, Field(min_length=1, max_length=128)]
+    content: QQKeyboardContent
+
+
 class QQMarkdown(BaseModel, extra="forbid"):
     type: Literal["markdown"]
     content: str | None = Field(default=None, min_length=1, max_length=4096)
     custom_template_id: str | None = Field(default=None, min_length=1, max_length=128)
     params: list[QQMarkdownParameter] | None = Field(default=None, max_length=32)
-    keyboard: dict[str, JsonValue] | None = Field(default=None, description="Native QQ keyboard object.")
+    keyboard: QQKeyboard | None = Field(default=None, description="QQ keyboard template ID or inline rows.")
 
     @model_validator(mode="after")
     def one_format(self):
@@ -326,15 +370,57 @@ class QQMarkdown(BaseModel, extra="forbid"):
             raise ValueError("Supply Markdown content or a QQ template ID.")
         if self.params is not None and self.custom_template_id is None:
             raise ValueError("Markdown params require a template ID.")
+        if self.keyboard is not None and ("id" in self.keyboard) == ("content" in self.keyboard):
+            raise ValueError("Specify a QQ keyboard template ID or inline rows.")
         return self
 
 
-class QQCard(BaseModel, extra="forbid"):
-    type: Literal["ark", "embed"]
-    card: dict[str, JsonValue] = Field(min_length=1, description="Native QQ Ark or Embed object.")
+class QQArkObjectField(TypedDict):
+    key: str
+    value: str
 
 
-type QQRichContent = QQMedia | QQMarkdown | QQCard
+class QQArkObject(TypedDict):
+    obj_kv: list[QQArkObjectField]
+
+
+class QQArkField(TypedDict):
+    key: str
+    value: NotRequired[str]
+    obj: NotRequired[list[QQArkObject]]
+
+
+class QQArkCard(TypedDict):
+    template_id: int
+    kv: list[QQArkField]
+
+
+class QQArk(BaseModel, extra="forbid"):
+    type: Literal["ark"]
+    card: QQArkCard
+
+
+class QQEmbedThumbnail(TypedDict):
+    url: str
+
+
+class QQEmbedField(TypedDict):
+    name: str
+
+
+class QQEmbedCard(TypedDict, total=False):
+    title: str
+    prompt: str
+    thumbnail: QQEmbedThumbnail
+    fields: list[QQEmbedField]
+
+
+class QQEmbed(BaseModel, extra="forbid"):
+    type: Literal["embed"]
+    card: QQEmbedCard
+
+
+type QQRichContent = QQMedia | QQMarkdown | QQArk | QQEmbed
 
 
 class QQReply(BaseModel, extra="forbid"):
@@ -361,7 +447,9 @@ def validate_rich(kind: str, text: str | None, rich: QQRichContent | None) -> No
             raise ValueError("Send non-image media and text as separate messages.")
     elif text:
         raise ValueError("Supply the Markdown or card as rich content without a separate text field.")
-    elif len(rich.model_dump_json()) > 16_384:
+    elif isinstance(rich, QQEmbed) and not rich.card:
+        raise ValueError("Supply at least one QQ Embed field.")
+    elif len(rich.model_dump_json().encode()) > 16_384:
         raise ValueError("QQ structured messages must be at most 16 KiB.")
 
 
