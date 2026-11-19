@@ -109,7 +109,14 @@ def test_qq_accounts_and_messages_are_owned_by_the_workspace(tmp_path, monkeypat
             with pytest.raises(ServiceError, match="already registered"):
                 await create(body, runtime, "writer", "ws_qq")
             await asyncio.wait_for(stored.wait(), timeout=2)
-            assert (await list_accounts("ws_qq")).accounts[0].state == "connected"
+            listed = (await list_accounts("ws_qq")).accounts[0]
+            assert listed.state == "connected"
+            assert (await endpoints["list_channel_accounts"]("ws_qq")).accounts[0].conversation_kinds == (
+                "private",
+                "group",
+                "guild",
+                "guild_dm",
+            )
             assert (await list_accounts("ws_other")).accounts == []
             with pytest.raises(ServiceError, match="qq_channel"):
                 await messages(account.id, "ws_other")

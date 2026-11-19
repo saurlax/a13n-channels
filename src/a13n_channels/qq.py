@@ -28,6 +28,7 @@ MESSAGE_TYPES = {
     "MESSAGE_CREATE": ("guild", "id", "channel_id"),
     "DIRECT_MESSAGE_CREATE": ("guild_dm", "id", "guild_id"),
 }
+QQ_CONVERSATION_KINDS = tuple(dict.fromkeys(kind for kind, _, _ in MESSAGE_TYPES.values()))
 
 type ChannelId = Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]{1,128}$")]
 type AppId = Annotated[str, Field(pattern=r"^[A-Za-z0-9_.:@-]{1,128}$")]

@@ -66,6 +66,14 @@ For Weixin, choose **Weixin ClawBot** in **Add channel**. Enter a name, get the 
 
 The Console page manages accounts and their connection status. To remove a QQ or Weixin channel, open its row and choose **Delete** in the editor footer. Confirming stops the connection and permanently deletes the channel and its locally stored messages, including messages from previous bot bindings. When a channel is paired with a different bot, incoming messages and replies use the new bot's identity. Earlier records stay associated with the previous bot. The App API supports receiving and replying to text messages, scoped to their source conversation. Disabling the App for an organization stops its connections and retains its stored accounts and messages.
 
+### GitHub and GitHub App
+
+Choose **GitHub** to connect a user with a classic personal access token. Grant `notifications` and the repository permissions needed for reading and commenting. The connector polls that user's notifications without marking them as read.
+
+Choose **GitHub App** to connect an installation with its App ID, installation ID, and PEM private key. Install the App on the selected repositories and grant **Issues** and **Pull requests** permissions for the conversations it should handle. Commenting requires write permission. The connector obtains short-lived installation tokens and polls repository activity.
+
+For either mode, set **GitHub repositories** (as `owner/repo`) and **Allowed GitHub users** under the delivery route’s **Filters**. Separate entries with commas. A GitHub message must match both lists and the route source. Polling covers the repositories configured on active routes. A source can select **Issue** or **Pull Request**, optionally with conversation IDs such as `owner/repo#42`. Issue and PR descriptions, ordinary comments, and PR review text and inline comments use the same conversation as the parent Issue or PR. The mentions filter recognizes the bound GitHub login or App slug and review requests explicitly assigned to that identity when present in polled activity. The send tool posts an ordinary comment to the originating Issue or PR. Polling coverage depends on GitHub notifications for user accounts and the repository activity returned for App installations.
+
 ## Route messages to Agents
 
 1. Enable **Channels** under **Settings → Organization → App plugins**.
@@ -74,7 +82,7 @@ The Console page manages accounts and their connection status. To remove a QQ or
 
 New matching messages trigger the target Agent. Channels loads the conversation tools automatically for each routed run. This workflow requires no changes in the Agent editor.
 
-Each source selects an account or all accounts, a conversation type or all types, and optionally one or more exact conversation IDs. Select an observed ID or enter it directly. Leave the conversation field empty to match every conversation of the selected type. Start with specific sources when only particular chats should be able to run the Agent.
+Each source selects an account or all accounts, a conversation type supported by the selected channel or all types, and optionally one or more exact conversation IDs. Select an observed ID or enter it directly. Leave the conversation field empty to match every conversation of the selected type. Start with specific sources when only particular chats should be able to run the Agent.
 
 Under **Filters**, choose whether group and guild messages must mention the bot or whether all received messages qualify. This applies across the route's sources. Private messages always pass this filter. New routes in Console default to mentions only. Older routes retain their saved behavior until a route-wide filter is selected. Ordinary group messages require QQ's receive-all-messages setting, and guild channels require the corresponding QQ permissions. A filtered message never falls through to a broader route.
 

@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field, TypeAdapter, field_validator
 from pydantic_ai import ModelRetry, RunContext, Tool
 from pydantic_ai.capabilities import Capability
 
-from a13n_channels.messages import ChannelMessage, ReplyText
+from a13n_channels.messages import ChannelMessage, ReplyText, message_table
 from a13n_channels.qq import ChannelId
 from a13n_channels.routing import select_route
 
@@ -103,7 +103,7 @@ async def source_entry(session, run):
 
 
 async def read_messages(store, account, kind: str, conversation_id: str, limit: int, before_id: str | None = None):
-    table = f"{account['platform']}_messages"
+    table = message_table(account["platform"])
     rows = await store.query(
         f"""SELECT payload FROM {table} WHERE channel_id = ? AND account_id = ?
             AND json_extract(payload, '$.kind') = ? AND json_extract(payload, '$.conversation_id') = ?
@@ -182,7 +182,12 @@ class HistoryTools(AbstractHarnessPlugin):
                WHERE workspace_id = ? AND organization_id = ?
                UNION ALL
                SELECT id, name, bot_id, 'weixin' FROM weixin_accounts
-               WHERE workspace_id = ? AND organization_id = ? AND bot_id IS NOT NULL ORDER BY name, id""",
+               WHERE workspace_id = ? AND organization_id = ? AND bot_id IS NOT NULL
+               UNION ALL
+               SELECT id, name, app_id, platform FROM github_accounts
+               WHERE workspace_id = ? AND organization_id = ? ORDER BY name, id""",
+            scope.workspace_id,
+            scope.organization_id,
             scope.workspace_id,
             scope.organization_id,
             scope.workspace_id,
@@ -279,7 +284,7 @@ class ChannelTools(AbstractHarnessPlugin):
             raise ModelRetry("The channel account is unavailable.")
         platform = account["platform"]
         rows = await active.store.query(
-            f"SELECT payload FROM {platform}_messages WHERE channel_id = ? AND account_id = ? AND message_id = ?",
+            f"SELECT payload FROM {message_table(platform)} WHERE channel_id = ? AND account_id = ? AND message_id = ?",
             job["channel_id"],
             job["account_id"],
             job["message_id"],
@@ -293,6 +298,7 @@ class ChannelTools(AbstractHarnessPlugin):
             message.kind,
             message.conversation_id,
             bot_mentioned=message.bot_mentioned,
+            sender_id=message.sender_id,
         )
         if (
             route is None

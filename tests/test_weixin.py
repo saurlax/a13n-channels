@@ -125,7 +125,9 @@ def test_weixin_pairing_and_text_exchange(monkeypatch, tmp_path):
             ).status == "need_verifycode"
             proof = PairingPoll(login_id=start.login_id, verify_code="1234")
             assert (await poll(account.id, proof, *workspace)).status == "confirmed"
-            assert (await endpoints["list_channel_accounts"]("ws_wx")).accounts[0].account_id is None
+            unpaired = (await endpoints["list_channel_accounts"]("ws_wx")).accounts[0]
+            assert unpaired.account_id is None
+            assert unpaired.conversation_kinds == ("private",)
             save = endpoints["save_weixin_pairing"]
             assert (await save(account.id, proof, *workspace)).status == "confirmed"
             assert (await poll(account.id, proof, *workspace)).status == "expired"

@@ -508,3 +508,8 @@
   padding-block-start: 12px;
   border-top: 1px solid var(--a13n-border);
 }
+
+
+.dark .a13n-channel-icon:is([data-platform="github"], [data-platform="github_app"]) {
+  filter: brightness(0) invert(1);
+}

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 import httpx
+import jwt
 from a13n_service.app_definitions import AppDefinition
 from a13n_service.app_plugins import Frontend
 from a13n_service.infra.db import short_session
@@ -32,12 +33,14 @@ from websockets.exceptions import WebSocketException
 
 from a13n_channels.accounts import Accounts
 from a13n_channels.delivery import Deliveries
+from a13n_channels.github import GITHUB_KINDS, GitHubBind, GitHubConnection, GitHubPlatform, stamp
 from a13n_channels.messages import ChannelMessage, TextReply
-from a13n_channels.qq import AppId, ChannelId, QQAccount, QQConnection, QQCreate, QQSecret
+from a13n_channels.qq import QQ_CONVERSATION_KINDS, AppId, ChannelId, QQAccount, QQConnection, QQCreate, QQSecret
 from a13n_channels.qq_pairing import LoginId, QQScan, QQScanCredentials, QQScans, QQScanSave, QQScanStatus
 from a13n_channels.routing import RouteInput
 from a13n_channels.tools import DELIVERY_FACTORY_KEY, FACTORY_KEY, ChannelToolFactory
 from a13n_channels.weixin import (
+    WEIXIN_CONVERSATION_KIND,
     LoginRequired,
     Pairing,
     PairingPoll,
@@ -50,6 +53,12 @@ from a13n_channels.weixin import (
 
 APP_ID = "saurlax.channels"
 SETTINGS = "channels"
+CONVERSATION_KINDS = {
+    "qq": QQ_CONVERSATION_KINDS,
+    "weixin": (WEIXIN_CONVERSATION_KIND,),
+    "github": GITHUB_KINDS,
+    "github_app": GITHUB_KINDS,
+}
 
 
 class ChannelsSettings(Section):
@@ -71,10 +80,11 @@ class QQAccounts(BaseModel):
 
 class ChannelAccount(BaseModel):
     id: str
-    platform: Literal["qq", "weixin"]
+    platform: Literal["qq", "weixin", "github", "github_app"]
     name: str
     account_id: str | None
     state: str
+    conversation_kinds: tuple[str, ...]
 
 
 class ChannelList(BaseModel):
@@ -110,6 +120,9 @@ class ChannelsRuntime:
             UNION ALL
             SELECT id, organization_id, workspace_id, name, bot_id, credentials,
                    NULL, NULL, cursor, credentials, 'weixin' FROM weixin_accounts WHERE credentials IS NOT NULL
+            UNION ALL
+            SELECT id, organization_id, workspace_id, name, app_id, credentials,
+                   NULL, NULL, cursor, credentials, platform FROM github_accounts
         """)
         if not rows:
             return {}
@@ -179,13 +192,25 @@ class ChannelsRuntime:
                 await self.store.receive(message, row["generation"])
 
             work = qq.listen(receive, status)
-        else:
+        elif row["platform"] == "weixin":
             weixin = WeixinConnection(self.http, channel_id, self.store.weixin_credentials(row))
 
             async def ingest(cursor: str, messages: list[tuple[ChannelMessage, str]]) -> None:
                 await self.store.receive_weixin(row, cursor, messages)
 
             work = weixin.listen(row["cursor"], ingest, status)
+        else:
+            binding = self.store.github_credentials(row)
+
+            async def ingest_github(message: ChannelMessage | None, cursor: str | None) -> None:
+                await self.store.receive_github(row, message, cursor)
+
+            async def repositories() -> set[str]:
+                return await self.store.github_repositories(row)
+
+            work = GitHubConnection(self.http, channel_id, binding).listen(
+                binding, row["cursor"], repositories, ingest_github, status
+            )
         status("connecting")
         return self.host.tasks.start(work, name=f"channels-{channel_id}")
 
@@ -215,6 +240,28 @@ class ChannelsRuntime:
                 raise ServiceError("unavailable", "QQ did not confirm the reply.") from None
             except (httpx.HTTPError, ValueError, KeyError, TypeError):
                 raise ServiceError("unavailable", "QQ did not confirm the reply.") from None
+
+        if account["platform"] in {"github", "github_app"}:
+            rows = await self.store.query(
+                "SELECT payload FROM github_messages WHERE channel_id = ? AND account_id = ? AND message_id = ?",
+                channel_id,
+                account["app_id"],
+                message_id,
+            )
+            if not rows:
+                raise not_found("github_message", message_id)
+            binding = self.store.github_credentials(account)
+            incoming = ChannelMessage.model_validate_json(rows[0]["payload"])
+            try:
+                return await GitHubConnection(self.http, channel_id, binding).reply(incoming, text)
+            except httpx.HTTPStatusError as error:
+                if error.response.status_code < 500:
+                    raise ServiceError(
+                        "invalid_argument", "GitHub rejected the comment. Check repository permissions."
+                    ) from None
+                raise ServiceError("unavailable", "GitHub did not confirm the comment.") from None
+            except (httpx.HTTPError, jwt.PyJWTError, ValueError, KeyError, TypeError):
+                raise ServiceError("unavailable", "GitHub did not confirm the comment.") from None
 
         source = await self.store.query(
             "SELECT payload, context FROM weixin_messages WHERE channel_id = ? AND account_id = ? AND message_id = ?",
@@ -250,6 +297,7 @@ class ChannelsRuntime:
             name=row["name"],
             account_id=row["account_id"],
             state=self.status.get(row["id"], default),
+            conversation_kinds=CONVERSATION_KINDS[row["platform"]],
         )
 
 
@@ -313,7 +361,10 @@ def definition() -> AppDefinition:
         rows = await channels.store.query(
             """SELECT id, name, app_id AS account_id, 'qq' AS platform FROM qq_accounts WHERE workspace_id = ?
                UNION ALL
-               SELECT id, name, bot_id, 'weixin' FROM weixin_accounts WHERE workspace_id = ? ORDER BY name, id""",
+               SELECT id, name, bot_id, 'weixin' FROM weixin_accounts WHERE workspace_id = ?
+               UNION ALL
+               SELECT id, name, app_id, platform FROM github_accounts WHERE workspace_id = ? ORDER BY name, id""",
+            workspace_id,
             workspace_id,
             workspace_id,
         )
@@ -383,9 +434,15 @@ def definition() -> AppDefinition:
                    SELECT payload, weixin_messages.rowid FROM weixin_messages
                    JOIN weixin_accounts ON weixin_accounts.id = weixin_messages.channel_id AND bot_id = account_id
                    WHERE weixin_accounts.workspace_id = ? AND channel_id = ?
+                   UNION ALL
+                   SELECT payload, github_messages.rowid FROM github_messages
+                   JOIN github_accounts ON github_accounts.id = github_messages.channel_id AND app_id = account_id
+                   WHERE github_accounts.workspace_id = ? AND channel_id = ?
                )
                SELECT json_extract(payload, '$.conversation_id') AS id FROM messages
                WHERE json_extract(payload, '$.kind') = ? GROUP BY id ORDER BY max(position) DESC LIMIT 100""",
+            workspace_id,
+            channel_id,
             workspace_id,
             channel_id,
             workspace_id,
@@ -456,6 +513,78 @@ def definition() -> AppDefinition:
     ) -> None:
         scope = await writable_scope(runtime, actor, workspace_id)
         await require_channels().store.delete_route(scope.workspace_id, route_id)
+
+    async def save_github(platform, body, runtime, actor, workspace_id, channel_id=None):
+        scope = await writable_scope(runtime, actor, workspace_id)
+        active = require_channels()
+        if bool(body.token) != (platform == "github"):
+            raise ServiceError("invalid_argument", "Credentials must match the GitHub channel type.")
+        previous = None
+        if channel_id:
+            rows = await active.store.query(
+                "SELECT * FROM github_accounts WHERE id = ? AND workspace_id = ? AND platform = ?",
+                channel_id,
+                workspace_id,
+                platform,
+            )
+            if not rows:
+                raise not_found("github_channel", channel_id)
+            previous = rows[0]
+        else:
+            channel_id = new_object_id("gh")
+            if not body.name or not body.name.strip():
+                raise ServiceError("invalid_argument", "Enter a channel name.")
+        try:
+            binding = await GitHubConnection(active.http, channel_id, body).bind(body)
+        except (httpx.HTTPError, jwt.PyJWTError, ValueError, KeyError, TypeError):
+            raise ServiceError(
+                "invalid_argument", "GitHub could not verify the credentials, repositories or allowed users."
+            ) from None
+        if previous and previous["app_id"] != binding.identity:
+            raise ServiceError("invalid_argument", "Use a new channel for a different GitHub identity.")
+        payload = binding.model_dump(mode="json", exclude={"token", "private_key"}, exclude_none=True)
+        if binding.token:
+            payload["token"] = binding.token.get_secret_value()
+        if binding.private_key:
+            payload["private_key"] = binding.private_key.get_secret_value()
+        credentials = active.store.seal(
+            scope.organization_id,
+            "channels.github_accounts",
+            "credentials",
+            channel_id,
+            json.dumps(payload).encode(),
+        )
+        try:
+            if previous:
+                rows = await active.store.query(
+                    """UPDATE github_accounts SET credentials = ?, cursor = ?
+                       WHERE id = ? AND workspace_id = ? AND credentials = ?
+                       RETURNING id, name, app_id AS account_id, platform""",
+                    credentials,
+                    stamp(),
+                    channel_id,
+                    workspace_id,
+                    previous["credentials"],
+                )
+                if not rows:
+                    raise ServiceError("conflict", "The GitHub account changed. Reopen the editor and retry.")
+            else:
+                rows = await active.store.query(
+                    """INSERT INTO github_accounts VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                       RETURNING id, name, app_id AS account_id, platform""",
+                    channel_id,
+                    scope.organization_id,
+                    workspace_id,
+                    body.name.strip(),
+                    platform,
+                    binding.identity,
+                    credentials,
+                    stamp(),
+                )
+        except sqlite3.IntegrityError:
+            raise ServiceError("conflict", "This GitHub identity is already connected in the workspace.") from None
+        active.changed.set()
+        return active.channel_view(rows[0])
 
     @router.get("/qq/accounts", name="list_qq_accounts")
     async def accounts(workspace_id: WorkspaceId) -> QQAccounts:
@@ -916,6 +1045,43 @@ def definition() -> AppDefinition:
         active = require_channels()
         account = await weixin_account(active, channel_id, workspace_id)
         return {"message_id": await active.send_reply(account, message_id, body.text)}
+
+    @router.post("/{platform}/accounts", status_code=201)
+    async def add_github(
+        platform: GitHubPlatform, body: GitHubBind, runtime: CurrentRuntime, actor: Actor, workspace_id: WorkspaceId
+    ) -> ChannelAccount:
+        return await save_github(platform, body, runtime, actor, workspace_id)
+
+    @router.patch("/{platform}/accounts/{channel_id}")
+    async def edit_github(
+        platform: GitHubPlatform,
+        channel_id: ChannelId,
+        body: GitHubBind,
+        runtime: CurrentRuntime,
+        actor: Actor,
+        workspace_id: WorkspaceId,
+    ) -> ChannelAccount:
+        return await save_github(platform, body, runtime, actor, workspace_id, channel_id)
+
+    @router.delete("/{platform}/accounts/{channel_id}", status_code=204)
+    async def delete_github(
+        platform: GitHubPlatform,
+        channel_id: ChannelId,
+        runtime: CurrentRuntime,
+        actor: Actor,
+        workspace_id: WorkspaceId,
+    ) -> None:
+        await writable_scope(runtime, actor, workspace_id)
+        active = require_channels()
+        rows = await active.store.query(
+            "DELETE FROM github_accounts WHERE id = ? AND workspace_id = ? AND platform = ? RETURNING id",
+            channel_id,
+            workspace_id,
+            platform,
+        )
+        if not rows:
+            raise not_found("github_channel", channel_id)
+        active.changed.set()
 
     return AppDefinition(
         app_id=APP_ID,

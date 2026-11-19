@@ -20,3 +20,12 @@ class ChannelMessage(BaseModel):
     text: str
     timestamp: str
     bot_mentioned: bool | None = None
+
+
+def message_table(platform: str) -> str:
+    return {
+        "qq": "qq_messages",
+        "weixin": "weixin_messages",
+        "github": "github_messages",
+        "github_app": "github_messages",
+    }[platform]

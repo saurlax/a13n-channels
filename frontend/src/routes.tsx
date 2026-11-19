@@ -15,12 +15,15 @@ const english = {
   sourceLimit: "Use at most 100 source rules, counting each conversation ID.",
   missing: "Unavailable", selectChannel: "Select a channel account",
   private: "Private chat", group: "Group chat", guild: "Guild channel", guild_dm: "Guild direct message",
+  githubRepositories: "GitHub repositories", githubUsers: "Allowed GitHub users",
+  githubHelp: "Separate entries with commas. GitHub messages require both filters.",
+  githubError: "Enter GitHub repositories and allowed users.",
   filters: "Filters", multiparty: "Group and channel messages",
   mentionsOnly: "Only @bot", allMessages: "All messages", originalFilters: "Keep current source filters",
   wakeAgent: "Wake Agent", noWakeAgent: "None",
   wakeHelp: "Decides whether matching messages reach the target Agent. Configure the criteria in the wake Agent’s instructions.",
   wakeError: "Choose a different published Agent in this workspace.",
-  channelKind: "Channel", thread: "Thread", allKinds: "All conversation types",
+  issue: "Issue", pullRequest: "Pull Request", channelKind: "Channel", thread: "Thread", allKinds: "All conversation types",
   cancel: "Cancel", save: "Save", remove: "Delete", deleteTitle: "Delete route",
   deleteError: "The route could not be deleted. Try again.",
   deleteBody: "New messages will stop using this route. Existing Console conversations are retained.",
@@ -51,12 +54,15 @@ const chinese: typeof english = {
   sourceLimit: "来源规则最多 100 条，每个会话 ID 各算一条。",
   missing: "不可用", selectChannel: "选择渠道账号",
   private: "私聊", group: "群聊", guild: "频道子频道", guild_dm: "频道私信",
+  githubRepositories: "GitHub 仓库", githubUsers: "允许触发的 GitHub 用户",
+  githubHelp: "用逗号分隔多个值。GitHub 消息需要同时匹配这两项。",
+  githubError: "请填写 GitHub 仓库和允许触发的用户。",
   filters: "筛选器", multiparty: "多人聊天消息",
   mentionsOnly: "仅 @ 机器人", allMessages: "全量消息", originalFilters: "保留已有来源筛选",
   wakeAgent: "唤醒 Agent", noWakeAgent: "不使用",
   wakeHelp: "决定匹配的消息是否交给目标 Agent。判断条件写在唤醒 Agent 的指令里。",
   wakeError: "请选择当前工作区内另一个已发布的 Agent。",
-  channelKind: "频道", thread: "话题", allKinds: "全部会话类型",
+  issue: "Issue", pullRequest: "Pull Request", channelKind: "频道", thread: "话题", allKinds: "全部会话类型",
   cancel: "取消", save: "保存", remove: "删除", deleteTitle: "删除路由",
   deleteError: "未能删除路由，请重试。",
   deleteBody: "新消息将不再使用这条路由。已有的 Console 会话会保留。",
@@ -77,16 +83,18 @@ const chinese: typeof english = {
   error: "操作未完成。请检查路由来源和目标 Agent。",
 };
 
-type Account = { id: string; name: string; platform: Platform };
+type Account = { id: string; name: string; platform: Platform; conversation_kinds: string[] };
 type Agent = { id: string; name: string };
 type Source = { channel_id: string; kind: string; conversation_id: string; mentions_only?: boolean };
 type MultipartyFilter = "all" | "mentions";
 type ThreadPolicy = keyof typeof english.policies;
 const threadPolicies: ThreadPolicy[] = ["conversation", "sender", "fixed", "message"];
+type GitHubFilter = { repositories: string[]; users: string[] };
 type RouteInput = {
   name: string; agent_id: string; enabled: boolean; sources: Source[];
   thread_policy: ThreadPolicy; fixed_thread_id: string | null;
   multiparty_messages: MultipartyFilter | null; wake_agent_id: string | null;
+  github_filter: GitHubFilter | null;
 };
 type Route = RouteInput & { id: string; attention: number; needs_authorization: boolean };
 type RouteList = { configured: boolean; routes: Route[] };
@@ -118,7 +126,7 @@ function conversationIds({ conversations, input }: SourceDraft): string[] {
   const id = input.trim();
   return id ? [...new Set([...conversations, id])] : conversations;
 }
-const kinds = ["*", "private", "group", "guild", "guild_dm"];
+
 
 function kindName(kind: string, text: Text) {
   switch (kind) {
@@ -129,6 +137,8 @@ function kindName(kind: string, text: Text) {
     case "guild_dm": return text.guild_dm;
     case "channel": return text.channelKind;
     case "thread": return text.thread;
+    case "issue": return text.issue;
+    case "pull_request": return text.pullRequest;
     default: return kind;
   }
 }
@@ -145,7 +155,8 @@ function SourceEditor({ source, accounts, update, remove, text, disabled }: {
   const app = useApp();
   const optionsId = React.useId();
   const account = accounts.find(item => item.id === source.channel_id);
-  const supported = account?.platform === "weixin" ? kinds.slice(0, 2) : kinds;
+  const allKinds = [...new Set(accounts.flatMap(item => item.conversation_kinds))];
+  const supported = ["*", ...(account?.conversation_kinds ?? allKinds)];
   function addConversation() {
     if (source.input.trim() === "*") return;
     update({ ...source, conversations: conversationIds(source), input: "" });
@@ -172,9 +183,10 @@ function SourceEditor({ source, accounts, update, remove, text, disabled }: {
               ? [{ value: source.channel_id, label: `${text.missing} (${source.channel_id})` }] : []),
           ]}
           onChange={id => {
-            const weixin = accounts.some(item => item.id === id && item.platform === "weixin");
-            update({ ...source, channel_id: id, kind: weixin ? "private" : source.kind, conversations: [], input: "",
-              mentions_only: !weixin && source.mentions_only });
+            const kinds = accounts.find(item => item.id === id)?.conversation_kinds ?? allKinds;
+            const kind = source.kind === "*" || kinds.includes(source.kind) ? source.kind : kinds[0] ?? "*";
+            update({ ...source, channel_id: id, kind, conversations: [], input: "",
+              mentions_only: kind === source.kind && source.mentions_only });
           }} />
       </td>
       <td>
@@ -272,6 +284,8 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
   const navigate = useNavigate();
   const [name, setName] = React.useState(route?.name ?? "");
   const [agent, setAgent] = React.useState(route?.agent_id ?? "");
+  const [githubRepositories, setGitHubRepositories] = React.useState(route?.github_filter?.repositories.join(", ") ?? "");
+  const [githubUsers, setGitHubUsers] = React.useState(route?.github_filter?.users.join(", ") ?? "");
   const [wakeAgent, setWakeAgent] = React.useState(route?.wake_agent_id ?? "");
   const legacyFilters = route?.multiparty_messages == null && Boolean(route?.sources.some(source => source.mentions_only));
   const [multiparty, setMultiparty] = React.useState<MultipartyFilter | "legacy">(
@@ -290,6 +304,12 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
   const [pending, setPending] = React.useState(false);
   const [error, setError] = React.useState("");
   const disabled = pending || !canEdit;
+  const githubAccounts = accounts.filter(item => item.platform === "github" || item.platform === "github_app");
+  const explicitGitHub = sources.some(({ value }) =>
+    value.kind === "issue" || value.kind === "pull_request" || githubAccounts.some(item => item.id === value.channel_id),
+  );
+  const showGitHub = explicitGitHub || sources.some(({ value }) => value.channel_id === "*" && value.kind === "*")
+    && (githubAccounts.length > 0 || Boolean(route?.github_filter));
   const canRemoveSource = canEdit && sources.length > 1;
 
   function returnToList() {
@@ -313,6 +333,13 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
       setError(text.sourceLimit);
       return;
     }
+    const repositories = githubRepositories.split(",").map(value => value.trim()).filter(Boolean);
+    const users = githubUsers.split(",").map(value => value.trim()).filter(Boolean);
+    const githubFilter = showGitHub && (repositories.length || users.length) ? { repositories, users } : null;
+    if ((githubFilter || (explicitGitHub && enabled)) && (!repositories.length || !users.length)) {
+      setError(text.githubError);
+      return;
+    }
     setPending(true);
     setError("");
     try {
@@ -321,7 +348,7 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           name, agent_id: agent, enabled,
-          sources: savedSources,
+          sources: savedSources, github_filter: githubFilter,
           multiparty_messages: multiparty === "legacy" ? null : multiparty, wake_agent_id: wakeAgent || null,
           thread_policy: policy, fixed_thread_id: policy === "fixed" ? threadId.trim() || null : null,
         } satisfies RouteInput),
@@ -330,6 +357,8 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
     } catch (error) {
       if (error instanceof ApiError && error.details.reason === "thread_destination_busy") {
         setError(text.busyThread);
+      } else if (error instanceof ApiError && error.details.field === "github_filter") {
+        setError(text.githubError);
       } else if (error instanceof ApiError && error.details.field === "wake_agent_id") {
         setError(text.wakeError);
       } else if (error instanceof ApiError && error.details.field === "fixed_thread_id") {
@@ -415,6 +444,15 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
                   ? [{ value: wakeAgent, label: `${text.missing} (${wakeAgent})`, disabled: true }] : []),
               ]} />
           </div>
+          {showGitHub && <>
+            <div className="a13n-route-settings">
+              <label>{text.githubRepositories}<Input value={githubRepositories} disabled={disabled}
+                placeholder="owner/repo" onChange={event => setGitHubRepositories(event.currentTarget.value)} /></label>
+              <label>{text.githubUsers}<Input value={githubUsers} disabled={disabled}
+                placeholder="octocat" onChange={event => setGitHubUsers(event.currentTarget.value)} /></label>
+            </div>
+            <p className="a13n-route-thread-help">{text.githubHelp}</p>
+          </>}
           <p className="a13n-route-thread-help">{text.wakeHelp}</p>
         </section>
         {error && <p role="alert">{error}</p>}

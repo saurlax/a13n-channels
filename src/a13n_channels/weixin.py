@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from a13n_channels.messages import ChannelMessage
 from a13n_channels.qr import qr_image
 
+WEIXIN_CONVERSATION_KIND = "private"
 WEIXIN_BASE = "https://ilinkai.weixin.qq.com"
 CLIENT_VERSION = "2.4.8"
 type PairingState = Literal[
@@ -99,7 +100,7 @@ def text_message(channel_id: str, bot_id: str, value: dict) -> tuple[ChannelMess
     return ChannelMessage(
         id=str(value["message_id"]),
         channel_id=channel_id,
-        kind="private",
+        kind=WEIXIN_CONVERSATION_KIND,
         conversation_id=sender,
         sender_id=sender,
         text=text,

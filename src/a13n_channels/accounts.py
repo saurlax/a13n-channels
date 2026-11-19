@@ -1,6 +1,7 @@
 """App-owned accounts, encrypted credentials, and received channel messages."""
 
 import asyncio
+import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
@@ -10,6 +11,7 @@ from a13n_service.infra.crypto import Envelope, KeyRing, SecretLocation
 from a13n_service.infra.errors import ServiceError, not_found
 from a13n_service.infra.ids import new_object_id
 
+from a13n_channels.github import GITHUB_KINDS, GitHubBinding
 from a13n_channels.messages import ChannelMessage
 from a13n_channels.qq import QQCreate, QQSecret
 from a13n_channels.routing import SCHEMA, Route, RouteInput, enqueue, read_routes, validate_route
@@ -40,6 +42,17 @@ class Accounts:
                 CREATE TABLE IF NOT EXISTS weixin_accounts (
                     id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, workspace_id TEXT NOT NULL,
                     name TEXT NOT NULL, bot_id TEXT UNIQUE, credentials TEXT, cursor TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS github_accounts (
+                    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, workspace_id TEXT NOT NULL,
+                    name TEXT NOT NULL, platform TEXT NOT NULL, app_id TEXT NOT NULL,
+                    credentials TEXT NOT NULL, cursor TEXT NOT NULL,
+                    UNIQUE (workspace_id, platform, app_id)
+                );
+                CREATE TABLE IF NOT EXISTS github_messages (
+                    channel_id TEXT NOT NULL REFERENCES github_accounts(id) ON DELETE CASCADE,
+                    account_id TEXT NOT NULL, message_id TEXT NOT NULL, payload TEXT NOT NULL,
+                    PRIMARY KEY (channel_id, account_id, message_id)
                 );
             """)
             db.executescript(SCHEMA)
@@ -123,14 +136,27 @@ class Accounts:
             previous = next((route for route in routes if route.id == route_id), None)
             if not create and previous is None:
                 raise not_found("channel_route", route_id)
-            validate_route(body, routes, route_id)
+            github_channels = {
+                row["id"]
+                for row in db.execute("SELECT id FROM github_accounts WHERE workspace_id = ?", (workspace_id,))
+            }
+            if (
+                body.enabled
+                and body.github_filter is None
+                and any(source.channel_id in github_channels or source.kind in GITHUB_KINDS for source in body.sources)
+            ):
+                raise ServiceError(
+                    "invalid_argument", "Set the GitHub repositories and allowed users.", {"field": "github_filter"}
+                )
+            validate_route(body, routes, route_id, github_channels)
             for source in body.sources:
                 if (
                     source.channel_id != "*"
                     and not db.execute(
                         """SELECT id FROM qq_accounts WHERE id = ? AND workspace_id = ?
-                       UNION ALL SELECT id FROM weixin_accounts WHERE id = ? AND workspace_id = ?""",
-                        (source.channel_id, workspace_id, source.channel_id, workspace_id),
+                       UNION ALL SELECT id FROM weixin_accounts WHERE id = ? AND workspace_id = ?
+                       UNION ALL SELECT id FROM github_accounts WHERE id = ? AND workspace_id = ?""",
+                        (source.channel_id, workspace_id) * 3,
                     ).fetchone()
                 ):
                     raise ServiceError("invalid_argument", "Choose a channel in this workspace.")
@@ -171,7 +197,14 @@ class Accounts:
                     route.agent_id,
                     route.enabled,
                     route.model_dump_json(
-                        include={"sources", "thread_policy", "fixed_thread_id", "multiparty_messages", "wake_agent_id"}
+                        include={
+                            "sources",
+                            "thread_policy",
+                            "fixed_thread_id",
+                            "multiparty_messages",
+                            "wake_agent_id",
+                            "github_filter",
+                        }
                     ),
                     binding_id,
                     principal_id,
@@ -290,3 +323,46 @@ class Accounts:
                 ).rowcount
                 if inserted:
                     enqueue(db, account["workspace_id"], account["app_id"], message)
+
+    def github_credentials(self, row: sqlite3.Row) -> GitHubBinding:
+        data = json.loads(
+            self.unseal(
+                row["organization_id"], "channels.github_accounts", "credentials", row["id"], row["credentials"]
+            )
+        )
+        data.pop("repositories", None)
+        data.pop("allowed_users", None)
+        return GitHubBinding.model_validate(data)
+
+    async def github_repositories(self, account: sqlite3.Row) -> set[str]:
+        return {
+            repository
+            for route in await self.routes(account["workspace_id"])
+            if route.enabled
+            and route.principal_id
+            and route.github_filter
+            and any(
+                source.channel_id in {"*", account["id"]} and source.kind in {"*", *GITHUB_KINDS}
+                for source in route.sources
+            )
+            for repository in route.github_filter.repositories
+        }
+
+    async def receive_github(self, account: sqlite3.Row, message: ChannelMessage | None, cursor: str | None) -> None:
+        await asyncio.to_thread(self._receive_github, account, message, cursor)
+
+    def _receive_github(self, account: sqlite3.Row, message: ChannelMessage | None, cursor: str | None) -> None:
+        with self.transaction() as db:
+            if message is None:
+                db.execute(
+                    "UPDATE github_accounts SET cursor = ? WHERE id = ? AND credentials = ?",
+                    (cursor, account["id"], account["credentials"]),
+                )
+                return
+            inserted = db.execute(
+                """INSERT OR IGNORE INTO github_messages
+                   SELECT id, app_id, ?, ? FROM github_accounts WHERE id = ? AND credentials = ?""",
+                (message.id, message.model_dump_json(), account["id"], account["credentials"]),
+            ).rowcount
+            if inserted:
+                enqueue(db, account["workspace_id"], account["app_id"], message)

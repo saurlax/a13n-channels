@@ -23,7 +23,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
 from a13n_channels.accounts import Accounts
-from a13n_channels.messages import ChannelMessage
+from a13n_channels.messages import ChannelMessage, message_table
 from a13n_channels.routing import Route, select_route
 from a13n_channels.tools import DELIVERY_FACTORY_KEY, FACTORY_KEY
 
@@ -121,7 +121,7 @@ class Deliveries:
             return
         platform = account["platform"]
         rows = await self.store.query(
-            f"SELECT payload FROM {platform}_messages WHERE channel_id = ? AND account_id = ? AND message_id = ?",
+            f"SELECT payload FROM {message_table(platform)} WHERE channel_id = ? AND account_id = ? AND message_id = ?",
             job["channel_id"],
             job["account_id"],
             job["message_id"],
@@ -136,6 +136,7 @@ class Deliveries:
             job["kind"],
             job["conversation_id"],
             bot_mentioned=message.bot_mentioned,
+            sender_id=message.sender_id,
         )
         if route is None or not route.enabled or not route.principal_id or route.binding_id != job["binding_id"]:
             await self.finish(job, "stopped")

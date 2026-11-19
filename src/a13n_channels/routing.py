@@ -8,11 +8,12 @@ from typing import Annotated, Literal
 from a13n_service.infra.errors import ServiceError
 from pydantic import BaseModel, Field, StringConstraints, model_validator
 
+from a13n_channels.github import GITHUB_KINDS, Login, RepositoryName
 from a13n_channels.messages import ChannelMessage
 
 type Choice = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=512)]
 type ThreadPolicy = Literal["conversation", "sender", "fixed", "message"]
-type Kind = Literal["private", "group", "guild", "guild_dm", "channel", "thread", "*"]
+type Kind = Literal["private", "group", "guild", "guild_dm", "channel", "thread", "issue", "pull_request", "*"]
 
 SCHEMA = """
     CREATE TABLE IF NOT EXISTS channel_routes (
@@ -51,10 +52,14 @@ SCHEMA = """
         DELETE FROM channel_deliveries WHERE channel_id = OLD.id;
         DELETE FROM channel_threads WHERE channel_id = OLD.id;
     END;
+    CREATE TRIGGER IF NOT EXISTS github_channel_delivery_delete AFTER DELETE ON github_accounts BEGIN
+        DELETE FROM channel_deliveries WHERE channel_id = OLD.id;
+        DELETE FROM channel_threads WHERE channel_id = OLD.id;
+    END;
 """
 
 
-MULTIPARTY_KINDS = {"group", "guild", "channel", "thread"}
+MULTIPARTY_KINDS = {"group", "guild", "channel", "thread", "issue", "pull_request"}
 
 
 class Source(BaseModel, frozen=True):
@@ -87,6 +92,21 @@ class Source(BaseModel, frozen=True):
         )
 
 
+class GitHubFilter(BaseModel):
+    repositories: list[RepositoryName] = Field(min_length=1, max_length=30)
+    users: list[Login] = Field(min_length=1, max_length=30)
+
+    @model_validator(mode="after")
+    def normalize(self) -> "GitHubFilter":
+        self.repositories = list(dict.fromkeys(name.lower() for name in self.repositories))
+        self.users = list(dict.fromkeys(name.lower() for name in self.users))
+        return self
+
+    def matches(self, conversation_id: str, sender_id: str | None) -> bool:
+        repository = conversation_id.rpartition("#")[0]
+        return repository.lower() in self.repositories and (sender_id or "").lower() in self.users
+
+
 class RouteInput(BaseModel):
     name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=80)]
     agent_id: Choice
@@ -96,6 +116,7 @@ class RouteInput(BaseModel):
     fixed_thread_id: Choice | None = None
     multiparty_messages: Literal["all", "mentions"] | None = None
     wake_agent_id: Choice | None = None
+    github_filter: GitHubFilter | None = None
 
     @model_validator(mode="after")
     def unique_sources(self) -> "RouteInput":
@@ -130,13 +151,23 @@ def read_routes(db: sqlite3.Connection, workspace_id: str) -> list[Route]:
 
 
 def select_route(
-    routes: list[Route], channel_id: str, kind: str, conversation_id: str, *, bot_mentioned: bool | None = None
+    routes: list[Route],
+    channel_id: str,
+    kind: str,
+    conversation_id: str,
+    *,
+    bot_mentioned: bool | None = None,
+    sender_id: str | None = None,
 ) -> Route | None:
     candidates = (
         (source, route)
         for route in routes
         for source in route.sources
         if source.matches(channel_id, kind, conversation_id)
+        and (
+            kind not in GITHUB_KINDS
+            or (route.github_filter and route.github_filter.matches(conversation_id, sender_id))
+        )
     )
     match = max(candidates, key=lambda candidate: candidate[0].specificity, default=None)
     if match is None:
@@ -148,17 +179,26 @@ def select_route(
     return route if kind not in MULTIPARTY_KINDS or not mentions_only or bot_mentioned is True else None
 
 
-def validate_route(route: RouteInput, routes: list[Route], route_id: str) -> None:
-    # For equal priority, the wildcard positions already match. Any overlap requires equal exact fields.
+def validate_route(route: RouteInput, routes: list[Route], route_id: str, github_channels: set[str]) -> None:
+    # Equal-priority matches share the same source address. GitHub-only sources can be split by policy.
     sources = {source.address for source in route.sources}
-    conflict = next(
-        (
-            other
-            for other in routes
-            if other.id != route_id and not sources.isdisjoint(source.address for source in other.sources)
-        ),
-        None,
-    )
+
+    def overlaps(other: Route) -> bool:
+        common = sources.intersection(source.address for source in other.sources)
+        for channel, kind, _ in common:
+            if channel not in github_channels and kind not in GITHUB_KINDS:
+                return True
+            left, right = route.github_filter, other.github_filter
+            if (
+                left
+                and right
+                and set(left.repositories).intersection(right.repositories)
+                and set(left.users).intersection(right.users)
+            ):
+                return True
+        return False
+
+    conflict = next((other for other in routes if other.id != route_id and overlaps(other)), None)
     if conflict:
         raise ServiceError("conflict", f'A source already belongs to the route "{conflict.name}".')
 
@@ -172,6 +212,7 @@ def enqueue(db: sqlite3.Connection, workspace_id: str, account_id: str, message:
         message.kind,
         message.conversation_id,
         bot_mentioned=message.bot_mentioned,
+        sender_id=message.sender_id,
     )
     if route is None or not route.enabled or not route.principal_id:
         return
