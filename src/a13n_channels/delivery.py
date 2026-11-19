@@ -245,7 +245,7 @@ class Deliveries:
         header = f"Channel source: {source}\n\nMessage:\n"
         body = {
             "agent_id": job["agent_id"],
-            "delivery": "next_run",
+            "delivery": "steer",
             "payload": {"content": [{"type": "text", "text": (header + message.text)[:65536]}]},
         }
         key = job["tool_key"]
@@ -270,7 +270,10 @@ class Deliveries:
                 instance_name += "_"
             plugins.append({"plugin_key": DELIVERY_FACTORY_KEY, "instance_name": instance_name})
             body["agent_revision_id"] = revision.id
-            body["options"] = {"overrides": {"plugins": plugins}}
+            body["options"] = {
+                "labels": {"channels.binding": job["binding_id"]},
+                "overrides": {"plugins": plugins},
+            }
             if thread_id is None:
                 body["session"] = {
                     "title": f"{account['name']} · {message.kind} · {message.conversation_id}"[:256],
@@ -327,7 +330,7 @@ class Deliveries:
             )
             run_id = entry.assigned_run_id
             if run_id is None:
-                if entry.status in {"rejected", "withdrawn"}:
+                if entry.status in {"failed", "rejected", "withdrawn"}:
                     await self.finish(job, "failed", "entry_rejected")
                 else:
                     await self.later(job, 2)

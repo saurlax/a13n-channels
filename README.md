@@ -92,7 +92,7 @@ A specific conversation wins over a wildcard conversation. The next tie-breakers
 
 Saving authorizes the route to submit inputs under the saving user's identity. The plugin loads that person's current workspace grants for each delivery and uses only the read and run verbs. Losing either grant pauses delivery. Saving as a different user starts fresh Threads. Routes created by the previous HTTP-based implementation require one save to authorize in-process delivery. Remove its delivery URL and Runner key settings when upgrading.
 
-Each matched message is submitted as one user input containing its source metadata and text. Messages sent to a busy Thread queue for a separate Run. The route selects one of four Thread policies:
+Each matched message is submitted as one user input containing its source metadata and text. New messages for the same delivery binding steer a compatible active Run. The host delivers immediately when supported and otherwise incorporates the message at a safe boundary. An idle Thread starts a Run. The per-message Thread policy always starts a fresh Run. The route selects one of four Thread policies:
 
 | Policy | Thread scope |
 | --- | --- |
@@ -110,7 +110,7 @@ Channel delivery adds two Harness tools to the target Agent for that run:
 - `channel_list_messages` reads recent incoming text from the originating conversation.
 - `channel_send_message` sends a text reply of up to 2,000 characters to the originating conversation. QQ and Weixin use the original message's reply context.
 
-Assistant text stays in Console. A channel reply requires a send tool call. The tools resolve the conversation from the run's delivery record and require a currently enabled route and account. They are available to the target Agent during channel delivery. Failed deliveries and unconfirmed sends appear in route status. A replay of the same send call never resends an unconfirmed reply.
+When a Run receives multiple channel messages, pass the intended message ID to the tools to select its conversation. Assistant text stays in Console. A channel reply requires a send tool call. The tools resolve the conversation from the run's delivery record and require a currently enabled route and account. They are available to the target Agent during channel delivery. Failed deliveries and unconfirmed sends appear in route status. A replay of the same send call never resends an unconfirmed reply.
 
 ### Read history from a Console conversation
 

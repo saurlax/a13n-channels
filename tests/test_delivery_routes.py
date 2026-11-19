@@ -184,7 +184,7 @@ def test_matched_text_retries_same_submission_and_reuses_source_thread(
             assert host is runtime and actor.id == "owner" and workspace_id == "workspace"
             assert allowed_verbs(actor, actor.confinement) == {"read", "run"}
             assert message.agent_id == "ag_012345678901234567890123456789ab"
-            assert message.delivery == "next_run"
+            assert message.delivery == "steer"
             assert message.options.overrides.plugins[0].plugin_key == "saurlax.channels.delivery"
             metadata, text = channel_input(message)
             assert text == f"prompt-{metadata['message_id']}"
@@ -478,11 +478,15 @@ def test_channel_tools_use_trusted_delivery_and_do_not_repeat_a_send(tmp_path, m
             source_entry_id="entry",
             authority=authority,
         )
-        entry = SimpleNamespace(assigned_run_id="run", request_key="channels-trusted")
+        keys = ["channels-trusted"]
 
         class Session:
             async def get(self, model, _id):
-                return run if model is tools.RunRow else entry
+                assert model is tools.RunRow
+                return run
+
+            async def scalars(self, _statement):
+                return keys
 
         @asynccontextmanager
         async def session(_storage):
@@ -526,7 +530,16 @@ def test_channel_tools_use_trusted_delivery_and_do_not_repeat_a_send(tmp_path, m
         assert await plugin.channel_send_message(ctx, "reply") == receipt
         assert await plugin.channel_send_message(ctx, "reply") == receipt
         assert sent == [("source", "reply")]
-        entry.request_key = "channels-fabricated"
+        await store.query("UPDATE channel_deliveries SET tool_key = 'channels-second' WHERE message_id = 'other-chat'")
+        keys.append("channels-second")
+        with pytest.raises(ModelRetry, match="Multiple channel messages"):
+            await plugin.channel_send_message(ctx, "reply")
+        assert [message["id"] for message in await plugin.channel_list_messages(ctx, message_id="other-chat")] == [
+            "other-chat"
+        ]
+        assert await plugin.channel_send_message(ctx, "second reply", message_id="other-chat") == receipt
+        assert sent[-1] == ("other-chat", "second reply")
+        keys[:] = ["channels-fabricated"]
         with pytest.raises(ModelRetry, match="no longer active"):
             await plugin.channel_send_message(ctx, "reply")
 

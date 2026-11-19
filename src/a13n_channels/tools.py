@@ -16,6 +16,7 @@ from a13n_service.tenancy.tables import OrganizationRow, WorkspaceRow
 from pydantic import BaseModel, Field, TypeAdapter, field_validator
 from pydantic_ai import ModelRetry, RunContext, Tool
 from pydantic_ai.capabilities import Capability
+from sqlalchemy import select
 
 from a13n_channels.messages import ChannelMessage, ReplyText, message_table
 from a13n_channels.qq import ChannelId
@@ -251,31 +252,53 @@ class ChannelTools(AbstractHarnessPlugin):
             Capability(
                 id=self.plugin_id,
                 instructions="Use channel_send_message to reply in the originating chat. Normal assistant text is "
-                "shown only in Console. Use channel_list_messages to inspect recent chat context.",
+                "shown only in Console. Use channel_list_messages to inspect recent chat context. "
+                "Pass the message_id from Channel source to select which input to read or reply to.",
                 tools=[Tool(self.channel_list_messages), Tool(self.channel_send_message)],
             )
         ]
 
-    async def source(self, ctx: RunContext[AgentContext]):
+    async def source(self, ctx: RunContext[AgentContext], message_id: str | None):
         active = self.factory.channels
         if active is None:
             raise ModelRetry("Channels is not configured on this Service.")
         async with short_session(active.host.storage) as session:
             run = await active_run(session, ctx)
-            entry = await source_entry(session, run)
-            key = entry.request_key if entry else None
-            if not key or not key.startswith("channels-"):
-                raise ModelRetry("Channel tools require a run started by a channel delivery.")
+            origins = [run.id]
+            origin = run
+            while origin.trigger == "resume" and origin.parent_run_id:
+                origin = await session.get_one(RunRow, origin.parent_run_id)
+                origins.append(origin.id)
+            keys = list(
+                await session.scalars(
+                    select(InboxEntryRow.request_key).where(
+                        InboxEntryRow.assigned_run_id.in_(origins),
+                        InboxEntryRow.kind == "message",
+                        InboxEntryRow.status.in_(("assigned", "consumed")),
+                        InboxEntryRow.request_key.startswith("channels-"),
+                    )
+                )
+            )
             workspace_id, principal_id, agent_id = run.workspace_id, run.principal_id, run.agent_id
             authority = ExecutionAuthority.model_validate(run.authority)
 
+        if not keys:
+            raise ModelRetry("Channel tools require a run with a channel delivery.")
+        placeholders = ", ".join("?" for _ in keys)
         rows = await active.store.query(
-            """SELECT * FROM channel_deliveries WHERE tool_key = ? AND workspace_id = ? AND agent_id = ?
-               AND status IN ('queued', 'submitted')""",
-            key,
+            f"""SELECT * FROM channel_deliveries WHERE tool_key IN ({placeholders})
+                AND workspace_id = ? AND agent_id = ? AND status IN ('queued', 'submitted')
+                AND (? IS NULL OR message_id = ?) LIMIT 2""",
+            *keys,
             workspace_id,
             agent_id,
+            message_id,
+            message_id,
         )
+        if len(rows) > 1:
+            raise ModelRetry(
+                "Multiple channel messages are in this run. Pass the exact message_id from Channel source."
+            )
         if not rows:
             raise ModelRetry("The channel delivery is no longer active.")
         job = rows[0]
@@ -317,15 +340,23 @@ class ChannelTools(AbstractHarnessPlugin):
         return active, account, job
 
     async def channel_list_messages(
-        self, ctx: RunContext[AgentContext], limit: Annotated[int, Field(ge=1, le=20)] = 10
+        self,
+        ctx: RunContext[AgentContext],
+        limit: Annotated[int, Field(ge=1, le=20)] = 10,
+        message_id: Annotated[str, Field(min_length=1, max_length=1024)] | None = None,
     ) -> list[dict]:
         """Read recent incoming text messages in the conversation that triggered this run, newest first."""
-        active, account, job = await self.source(ctx)
+        active, account, job = await self.source(ctx, message_id)
         return await read_messages(active.store, account, job["kind"], job["conversation_id"], limit)
 
-    async def channel_send_message(self, ctx: RunContext[AgentContext], text: ReplyText) -> dict:
+    async def channel_send_message(
+        self,
+        ctx: RunContext[AgentContext],
+        text: ReplyText,
+        message_id: Annotated[str, Field(min_length=1, max_length=1024)] | None = None,
+    ) -> dict:
         """Send a text reply to the chat that triggered this run. Only call this when you want the chat to see it."""
-        active, account, job = await self.source(ctx)
+        active, account, job = await self.source(ctx, message_id)
         if ctx.tool_call_id is None:
             raise ModelRetry("A recorded tool call is required to send a message.")
         call_id = sha256(ctx.tool_call_id.encode()).hexdigest()
