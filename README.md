@@ -1,4 +1,4 @@
-# Channels
+# a13n-channels
 
 An a13n Service App for connecting messaging platforms and event sources to Agents. Manage channel accounts and delivery routes in Console. Agents can look up stored messages across allowed channel accounts and reply through the source channel.
 
