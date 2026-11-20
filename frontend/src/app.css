@@ -523,6 +523,10 @@
 }
 
 
+.dark .a13n-channel-icon[data-platform="mqtt"] {
+  filter: brightness(2);
+}
+
 .a13n-route-all-conversations {
   display: flex;
   align-items: center;

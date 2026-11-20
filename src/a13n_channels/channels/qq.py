@@ -18,8 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from websockets.asyncio.client import connect
 from websockets.exceptions import WebSocketException
 
-from a13n_channels.messages import ChannelMessage
-from a13n_channels.qq_content import (
+from a13n_channels.channels.qq_content import (
     MEDIA_LIMITS,
     MEDIA_TYPES,
     QQArk,
@@ -33,6 +32,7 @@ from a13n_channels.qq_content import (
     project_content,
     validate_rich,
 )
+from a13n_channels.messages import ChannelMessage
 
 QQ_TOKEN = "https://bots.qq.com/app/getAppAccessToken"
 QQ_API = "https://api.sgroup.qq.com"

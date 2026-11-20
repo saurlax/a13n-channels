@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 import httpx
 import pytest
 
-from a13n_channels import qq
+from a13n_channels.channels import qq
 
 
 def test_qq_identifies_receives_resumes_and_replies(monkeypatch):

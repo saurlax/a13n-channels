@@ -1,10 +1,18 @@
 [project]
 name = "a13n-channels"
-version = "0.6.28"
+version = "0.6.29"
 description = "Channels"
 readme = "README.md"
+license-files = ["frontend/src/icons/NOTICE.md"]
 requires-python = ">=3.13"
-dependencies = ["a13n-service", "httpx>=0.28,<1", "websockets>=15,<16", "qrcode>=8,<9", "pyjwt[crypto]>=2.10,<3"]
+dependencies = [
+    "a13n-service",
+    "httpx>=0.28,<1",
+    "websockets>=15,<16",
+    "qrcode>=8,<9",
+    "pyjwt[crypto]>=2.10,<3",
+    "protobuf>=6,<7",
+]
 
 [project.entry-points."a13n_service.app_plugins"]
 "saurlax.channels" = "a13n_channels.app:definition"

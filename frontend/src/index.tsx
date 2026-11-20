@@ -2,7 +2,7 @@ import {
   React, ApiError, Button, Empty, ErrorPage, Input, Link, Loading, Page, Textarea,
   useAccess, useApp, useQuery, useQueryClient, useParams, useSearchParams, useTranslation,
 } from "@a13n/console";
-import { ChannelIcon, platforms, type Platform } from "./channel-icon";
+import { ChannelIcon, builtInPlatforms, type Platform } from "./channel-icon";
 import { RoutePage } from "./routes";
 import { ChannelSelect } from "./select";
 import "./app.css";
@@ -11,6 +11,7 @@ const english = {
   title: "Channels", add: "Add channel", name: "Name", secret: "AppSecret",
   channelType: "Channel type", qq: "QQ Bot", weixin: "Weixin ClawBot", github: "GitHub", github_app: "GitHub App", status: "Status",
   githubToken: "Classic personal access token", privateKey: "Private key (PEM)",
+  keepCurrent: "Leave blank to keep the current value",
   secretPlaceholder: "Leave blank to keep the current AppSecret", remove: "Delete", cancel: "Cancel", save: "Save",
   empty: "No channels yet", unconfigured: "Channels storage is not configured.",
   deleteTitle: "Delete channel",
@@ -31,6 +32,7 @@ const chinese: typeof english = {
   title: "渠道", add: "添加渠道", name: "名称", secret: "AppSecret",
   channelType: "渠道类型", qq: "QQ 机器人", weixin: "微信 ClawBot", github: "GitHub", github_app: "GitHub App", status: "状态",
   githubToken: "Classic PAT", privateKey: "密钥",
+  keepCurrent: "留空则保留当前值",
   secretPlaceholder: "留空则保留现有 AppSecret", remove: "删除", cancel: "取消", save: "保存",
   empty: "暂无渠道", unconfigured: "尚未配置渠道存储。",
   deleteTitle: "删除渠道",
@@ -50,11 +52,22 @@ const chinese: typeof english = {
 type Account = { id: string; name: string; platform: Platform; account_id: string | null; state: string };
 type Pairing = { login_id: string; qr_image: string; status: string };
 type QQScan = { login_id: string; qr_image: string | null; status: "wait" | "confirmed" | "expired" | "failed" };
-type Accounts = { configured: boolean; accounts: Account[]; qq_scan_available: boolean };
+type Connector = {
+  key: string; label: string; label_zh: string;
+  fields: { key: string; label: string; label_zh: string; secret: boolean; required: boolean }[];
+};
+type Accounts = { configured: boolean; accounts: Account[]; qq_scan_available: boolean; connectors?: Connector[] };
 type Action = { kind: "add" } | { kind: "edit"; account: Account };
 
-const endpoint = (platform: Platform) => `/${platform}/accounts`;
+const endpoint = (platform: Platform) => builtInPlatforms.some(value => value === platform)
+  ? `/${platform}/accounts` : `/connectors/${encodeURIComponent(platform)}/accounts`;
 const accountPath = (account: Account) => `${endpoint(account.platform)}/${encodeURIComponent(account.id)}`;
+const platformName = (platform: Platform, text: typeof english, connectors: Connector[]) => {
+  const connector = connectors.find(item => item.key === platform);
+  if (connector) return text === chinese ? connector.label_zh : connector.label;
+  const known = builtInPlatforms.find(value => value === platform);
+  return known ? text[known] : platform;
+};
 
 function ChannelStatus({ state, text }: { state: string; text: typeof english }) {
   const statuses = {
@@ -79,16 +92,16 @@ async function requireSuccess(response: Response) {
   return response;
 }
 
-function ChannelEditorHeader({ account, text, titleId }: {
+function ChannelEditorHeader({ account, label, titleId }: {
   account: Account;
-  text: typeof english;
+  label: string;
   titleId: string;
 }) {
   return (
     <header className="a13n-channel-edit-header">
       <h2 id={titleId}>{account.name}</h2>
       <p id={`${titleId}-description`} className="a13n-channel-icon-label">
-        <ChannelIcon platform={account.platform} />{text[account.platform]}
+        <ChannelIcon platform={account.platform} />{label}
       </p>
     </header>
   );
@@ -152,13 +165,14 @@ function DeleteChannelDialog({ account, text, dismiss, onDeleted }: {
   );
 }
 
-function AccountDialog({ action, text, dismiss, pair, requestDelete, qqScanAvailable }: {
+function AccountDialog({ action, text, dismiss, pair, requestDelete, qqScanAvailable, connectors }: {
   action: Action;
   text: typeof english;
   dismiss: () => void;
   pair: (account: Account) => void;
   requestDelete: (account: Account) => void;
   qqScanAvailable: boolean;
+  connectors: Connector[];
 }) {
   const app = useApp();
   const client = useQueryClient();
@@ -177,6 +191,7 @@ function AccountDialog({ action, text, dismiss, pair, requestDelete, qqScanAvail
   const [hasSecret, setHasSecret] = React.useState(false);
   const qqFields = platform === "qq";
   const githubFields = platform === "github" || platform === "github_app";
+  const connector = connectors.find(item => item.key === platform);
   const scanning = qqFields && qqMethod === "scan";
   const scanReady = scan?.status === "confirmed";
   const [pending, setPending] = React.useState(false);
@@ -275,9 +290,16 @@ function AccountDialog({ action, text, dismiss, pair, requestDelete, qqScanAvail
         if (scanPath) body.channel_id = action.account.id;
         if (body.app_secret === "") delete body.app_secret;
       }
+      const connectorBody = connector && {
+        ...(add ? { name: body.name } : {}),
+        config: Object.fromEntries(connector.fields.flatMap(field => {
+          const value = String(body[field.key] ?? "").trim();
+          return value ? [[field.key, value]] : [];
+        })),
+      };
       const response = await app.request(path, {
         method,
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(connectorBody ?? body),
       });
       if (scanning && response.status === 404) {
         setScan(null);
@@ -288,7 +310,7 @@ function AccountDialog({ action, text, dismiss, pair, requestDelete, qqScanAvail
       if (add && platform === "weixin") pair(await response.json());
       dismiss();
     } catch (error) {
-      setFailed(githubFields && error instanceof ApiError ? error.message : true);
+      setFailed((githubFields || connector) && error instanceof ApiError ? error.message : true);
     } finally {
       setPending(false);
       void client.invalidateQueries({ queryKey: app.queryKey("channel-accounts") });
@@ -303,17 +325,25 @@ function AccountDialog({ action, text, dismiss, pair, requestDelete, qqScanAvail
       onCancel={(event) => { event.preventDefault(); if (!pending) dismiss(); }}>
       <form ref={form} onSubmit={submit}>
         {editing
-          ? <ChannelEditorHeader account={action.account} text={text} titleId={titleId} />
+          ? <ChannelEditorHeader account={action.account} label={platformName(platform, text, connectors)} titleId={titleId} />
           : <h2 id={titleId}>{text.add}</h2>}
         {add && <>
           <label htmlFor={`${titleId}-platform`}>{text.channelType}
             <ChannelSelect id={`${titleId}-platform`} label={text.channelType} container={dialog}
               value={platform} disabled={pending || testing}
-              options={platforms.map(value => ({ value, label: text[value], icon: <ChannelIcon platform={value} /> }))}
+              options={[...builtInPlatforms, ...connectors.map(item => item.key)]
+                .map(value => ({ value, label: platformName(value, text, connectors), icon: <ChannelIcon platform={value} /> }))}
               onChange={value => { setConnection("idle"); setPlatform(value); }} />
           </label>
           <label>{text.name}<Input name="name" required maxLength={80} disabled={pending} /></label>
         </>}
+        {connector?.fields.map(field => (
+          <label key={`${connector.key}:${field.key}`}>{text === chinese ? field.label_zh : field.label}
+            <Input name={field.key} type={field.secret ? "password" : "text"}
+              autoComplete={field.secret ? "new-password" : "off"} required={add && field.required}
+              placeholder={editing ? text.keepCurrent : undefined} maxLength={4096} disabled={pending} />
+          </label>
+        ))}
         {githubFields && <>
           {platform === "github" ? (
             <label>{text.githubToken}<Input name="token" type="password" required autoComplete="new-password" /></label>
@@ -510,7 +540,7 @@ function Channels({ nav }: { nav: React.ReactNode }) {
   });
   if (query.isPending) return <Loading page />;
   if (!query.data) return <ErrorPage error={query.error} />;
-  const { accounts, configured, qq_scan_available } = query.data;
+  const { accounts, configured, qq_scan_available, connectors = [] } = query.data;
   const editable = can("write") && !workspace?.archived_at;
   const editChannel = (account: Account) => {
     if (account.platform === "weixin") setPairing(account);
@@ -554,7 +584,7 @@ function Channels({ nav }: { nav: React.ReactNode }) {
                   </th>
                   <td role="cell" data-label={text.channelType}>
                     <span className="a13n-channel-icon-label">
-                      <ChannelIcon platform={account.platform} />{text[account.platform]}
+                      <ChannelIcon platform={account.platform} />{platformName(account.platform, text, connectors)}
                     </span>
                   </td>
                   <td role="cell" data-label={text.status}>
@@ -569,7 +599,8 @@ function Channels({ nav }: { nav: React.ReactNode }) {
       {editable && pairing && <PairingDialog account={pairing} text={text}
         dismiss={() => setPairing(null)} requestDelete={setDeleting} />}
       {editable && action && <AccountDialog key={action.kind} action={action} text={text}
-        dismiss={() => setAction(null)} pair={setPairing} requestDelete={setDeleting} qqScanAvailable={qq_scan_available} />}
+        dismiss={() => setAction(null)} pair={setPairing} requestDelete={setDeleting}
+        qqScanAvailable={qq_scan_available} connectors={connectors} />}
       {editable && deleting && <DeleteChannelDialog account={deleting} text={text}
         dismiss={() => setDeleting(null)} onDeleted={finishDelete} />}
     </Page>

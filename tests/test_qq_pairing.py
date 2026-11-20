@@ -10,7 +10,7 @@ from a13n_service.tenancy.authorize import WorkspaceScope
 from pydantic import SecretStr
 
 from a13n_channels import app
-from a13n_channels.qq_pairing import QQScanSave
+from a13n_channels.channels.qq_pairing import QQScanSave
 
 
 def test_qq_scan_saves_credentials_only_for_the_initiating_workspace_and_actor(tmp_path, monkeypatch):

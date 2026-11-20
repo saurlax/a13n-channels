@@ -7,7 +7,7 @@ import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated
 
 import httpx
 import jwt
@@ -32,10 +32,9 @@ from sqlalchemy.exc import SQLAlchemyError
 from websockets.exceptions import WebSocketException
 
 from a13n_channels.accounts import Accounts
-from a13n_channels.delivery import Deliveries
-from a13n_channels.github import GITHUB_KINDS, GitHubBind, GitHubConnection, GitHubPlatform, stamp
-from a13n_channels.messages import ChannelMessage, TextReply
-from a13n_channels.qq import (
+from a13n_channels.channels.adapter import ChannelError, Connection
+from a13n_channels.channels.github import GITHUB_KINDS, GitHubBind, GitHubConnection, GitHubPlatform, stamp
+from a13n_channels.channels.qq import (
     QQ_CONVERSATION_KINDS,
     AppId,
     ChannelId,
@@ -45,11 +44,10 @@ from a13n_channels.qq import (
     QQRejected,
     QQSecret,
 )
-from a13n_channels.qq_content import QQReply, QQRichContent, validate_rich
-from a13n_channels.qq_pairing import LoginId, QQScan, QQScanCredentials, QQScans, QQScanSave, QQScanStatus
-from a13n_channels.routing import RouteInput
-from a13n_channels.tools import DELIVERY_FACTORY_KEY, FACTORY_KEY, ChannelToolFactory
-from a13n_channels.weixin import (
+from a13n_channels.channels.qq_content import QQReply, QQRichContent, validate_rich
+from a13n_channels.channels.qq_pairing import LoginId, QQScan, QQScanCredentials, QQScans, QQScanSave, QQScanStatus
+from a13n_channels.channels.registry import ADAPTERS
+from a13n_channels.channels.weixin import (
     WEIXIN_CONVERSATION_KIND,
     LoginRequired,
     Pairing,
@@ -60,10 +58,15 @@ from a13n_channels.weixin import (
     poll_pairing,
     start_pairing,
 )
+from a13n_channels.connector_accounts import ConnectorDescription, ConnectorInput, save_account
+from a13n_channels.delivery import Deliveries
+from a13n_channels.messages import ChannelMessage, TextReply, message_table
+from a13n_channels.routing import RouteInput
+from a13n_channels.tools import DELIVERY_FACTORY_KEY, FACTORY_KEY, ChannelToolFactory
 
 APP_ID = "saurlax.channels"
 SETTINGS = "channels"
-CONVERSATION_KINDS = {
+LEGACY_CONVERSATION_KINDS = {
     "qq": QQ_CONVERSATION_KINDS,
     "weixin": (WEIXIN_CONVERSATION_KIND,),
     "github": GITHUB_KINDS,
@@ -90,7 +93,7 @@ class QQAccounts(BaseModel):
 
 class ChannelAccount(BaseModel):
     id: str
-    platform: Literal["qq", "weixin", "github", "github_app"]
+    platform: str
     name: str
     account_id: str | None
     state: str
@@ -101,6 +104,7 @@ class ChannelList(BaseModel):
     configured: bool
     accounts: list[ChannelAccount]
     qq_scan_available: bool = False
+    connectors: list[ConnectorDescription] = Field(default_factory=list)
 
 
 class ChannelsRuntime:
@@ -109,6 +113,7 @@ class ChannelsRuntime:
         self.store = store
         self.http = http
         self.members: dict[str, tuple[str, asyncio.Task]] = {}
+        self.connectors: dict[str, tuple[str, Connection]] = {}
         self.status: dict[str, str] = {}
         self.changed = asyncio.Event()
         self.pairings: dict[str, Pairing] = {}
@@ -125,14 +130,7 @@ class ChannelsRuntime:
 
     async def _enabled_accounts(self) -> dict[str, sqlite3.Row]:
         rows = await self.store.query("""
-            SELECT id, organization_id, workspace_id, name, app_id, app_secret AS generation,
-                   app_secret, intents, '' AS cursor, NULL AS credentials, 'qq' AS platform FROM qq_accounts
-            UNION ALL
-            SELECT id, organization_id, workspace_id, name, bot_id, credentials,
-                   NULL, NULL, cursor, credentials, 'weixin' FROM weixin_accounts WHERE credentials IS NOT NULL
-            UNION ALL
-            SELECT id, organization_id, workspace_id, name, app_id, credentials,
-                   NULL, NULL, cursor, credentials, platform FROM github_accounts
+            SELECT * FROM channel_accounts WHERE generation IS NOT NULL
         """)
         if not rows:
             return {}
@@ -167,12 +165,13 @@ class ChannelsRuntime:
                         task.cancel()
                         await asyncio.gather(task, return_exceptions=True)
                         self.members.pop(channel_id)
+                        self.connectors.pop(channel_id, None)
                         self.status.pop(channel_id, None)
                 for channel_id, row in desired.items():
                     if channel_id not in self.members:
                         try:
                             task = self._listen(row)
-                        except ServiceError:
+                        except (ServiceError, ChannelError):
                             self.status[channel_id] = "error"
                             continue
                         self.members[channel_id] = (row["generation"], task)
@@ -188,6 +187,7 @@ class ChannelsRuntime:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            self.connectors.clear()
 
     def _listen(self, row: sqlite3.Row) -> asyncio.Task:
         channel_id = row["id"]
@@ -209,6 +209,17 @@ class ChannelsRuntime:
                 await self.store.receive_weixin(row, cursor, messages)
 
             work = weixin.listen(row["cursor"], ingest, status)
+        elif row["platform"] in ADAPTERS:
+            adapter = ADAPTERS[row["platform"]]
+            connection = adapter.connect(self.http, channel_id, row["app_id"], self.store.connector_credentials(row))
+
+            async def ingest_connector(
+                message: ChannelMessage | None, *, cursor: str | None = None, context: dict[str, str] | None = None
+            ) -> None:
+                await self.store.receive_connector(row, message, cursor, context)
+
+            self.connectors[channel_id] = (row["generation"], connection)
+            work = connection.listen(row["cursor"], ingest_connector, status)
         else:
             binding = self.store.github_credentials(row)
 
@@ -283,6 +294,43 @@ class ChannelsRuntime:
         if text is None or rich is not None or reference_id is not None:
             raise ServiceError("invalid_argument", "This channel supports text replies.")
 
+        if account["platform"] in ADAPTERS:
+            rows = await self.store.query(
+                """SELECT message.payload, message.context FROM connector_messages AS message
+                   JOIN connector_accounts AS account ON account.id = message.channel_id
+                   WHERE message.channel_id = ? AND message.account_id = ? AND message.message_id = ?
+                   AND account.credentials = ?""",
+                channel_id,
+                account["app_id"],
+                message_id,
+                account["generation"],
+            )
+            if not rows:
+                raise not_found("channel_message", message_id)
+            member = self.connectors.get(channel_id)
+            if member is None or member[0] != account["generation"]:
+                raise ServiceError("unavailable", "The connector is reconnecting.")
+            private = rows[0]["context"]
+            context = (
+                json.loads(
+                    self.store.unseal(
+                        account["organization_id"],
+                        "channels.connector_messages",
+                        "context",
+                        f"{channel_id}:{message_id}",
+                        private,
+                    )
+                )
+                if private
+                else {}
+            )
+            try:
+                return await member[1].reply(ChannelMessage.model_validate_json(rows[0]["payload"]), text, context)
+            except ChannelError as error:
+                raise ServiceError("unavailable" if error.retryable else "invalid_argument", str(error)) from None
+            except (httpx.HTTPError, OSError, TimeoutError, ValueError, KeyError, TypeError, WebSocketException):
+                raise ServiceError("unavailable", "The connector did not confirm delivery.") from None
+
         if account["platform"] in {"github", "github_app"}:
             rows = await self.store.query(
                 "SELECT payload FROM github_messages WHERE channel_id = ? AND account_id = ? AND message_id = ?",
@@ -339,7 +387,11 @@ class ChannelsRuntime:
             name=row["name"],
             account_id=row["account_id"],
             state=self.status.get(row["id"], default),
-            conversation_kinds=CONVERSATION_KINDS[row["platform"]],
+            conversation_kinds=(
+                ADAPTERS[row["platform"]].kinds
+                if row["platform"] in ADAPTERS
+                else LEGACY_CONVERSATION_KINDS[row["platform"]]
+            ),
         )
 
 
@@ -401,20 +453,62 @@ def definition() -> AppDefinition:
         if channels is None:
             return ChannelList(configured=False, accounts=[])
         rows = await channels.store.query(
-            """SELECT id, name, app_id AS account_id, 'qq' AS platform FROM qq_accounts WHERE workspace_id = ?
-               UNION ALL
-               SELECT id, name, bot_id, 'weixin' FROM weixin_accounts WHERE workspace_id = ?
-               UNION ALL
-               SELECT id, name, app_id, platform FROM github_accounts WHERE workspace_id = ? ORDER BY name, id""",
-            workspace_id,
-            workspace_id,
+            """SELECT id, name, app_id AS account_id, platform FROM channel_accounts
+               WHERE workspace_id = ? ORDER BY name, id""",
             workspace_id,
         )
         return ChannelList(
             configured=True,
             accounts=[channels.channel_view(row) for row in rows],
             qq_scan_available=channels.qq_connector is not None,
+            connectors=[
+                ConnectorDescription(key=item.key, label=item.label, label_zh=item.label_zh, fields=item.fields)
+                for item in ADAPTERS.values()
+            ],
         )
+
+    @router.post("/connectors/{platform}/accounts", status_code=201)
+    async def add_connector(
+        platform: str, body: ConnectorInput, runtime: CurrentRuntime, actor: Actor, workspace_id: WorkspaceId
+    ) -> ChannelAccount:
+        scope = await writable_scope(runtime, actor, workspace_id)
+        adapter = ADAPTERS.get(platform)
+        if adapter is None:
+            raise not_found("connector", platform)
+        active = require_channels()
+        return active.channel_view(await save_account(active, scope, adapter, body, None))
+
+    @router.patch("/connectors/{platform}/accounts/{channel_id}")
+    async def edit_connector(
+        platform: str,
+        channel_id: ChannelId,
+        body: ConnectorInput,
+        runtime: CurrentRuntime,
+        actor: Actor,
+        workspace_id: WorkspaceId,
+    ) -> ChannelAccount:
+        scope = await writable_scope(runtime, actor, workspace_id)
+        adapter = ADAPTERS.get(platform)
+        if adapter is None:
+            raise not_found("connector", platform)
+        active = require_channels()
+        return active.channel_view(await save_account(active, scope, adapter, body, channel_id))
+
+    @router.delete("/connectors/{platform}/accounts/{channel_id}", status_code=204)
+    async def delete_connector(
+        platform: str, channel_id: ChannelId, runtime: CurrentRuntime, actor: Actor, workspace_id: WorkspaceId
+    ) -> None:
+        await writable_scope(runtime, actor, workspace_id)
+        active = require_channels()
+        rows = await active.store.query(
+            "DELETE FROM connector_accounts WHERE id = ? AND workspace_id = ? AND platform = ? RETURNING id",
+            channel_id,
+            workspace_id,
+            platform,
+        )
+        if not rows:
+            raise not_found("channel", channel_id)
+        active.changed.set()
 
     @router.get("/routes", name="list_channel_routes")
     async def list_routes(workspace_id: WorkspaceId) -> dict:
@@ -467,28 +561,18 @@ def definition() -> AppDefinition:
     @router.get("/route-sources", name="list_route_sources")
     async def route_sources(workspace_id: WorkspaceId, channel_id: ChannelId, kind: str) -> list[dict[str, str]]:
         active = require_channels()
+        accounts = await active.store.query(
+            "SELECT platform, app_id FROM channel_accounts WHERE workspace_id = ? AND id = ?", workspace_id, channel_id
+        )
+        if not accounts:
+            return []
+        account = accounts[0]
         rows = await active.store.query(
-            """WITH messages AS (
-                   SELECT payload, qq_messages.rowid AS position FROM qq_messages
-                   JOIN qq_accounts ON qq_accounts.id = qq_messages.channel_id AND app_id = account_id
-                   WHERE qq_accounts.workspace_id = ? AND channel_id = ?
-                   UNION ALL
-                   SELECT payload, weixin_messages.rowid FROM weixin_messages
-                   JOIN weixin_accounts ON weixin_accounts.id = weixin_messages.channel_id AND bot_id = account_id
-                   WHERE weixin_accounts.workspace_id = ? AND channel_id = ?
-                   UNION ALL
-                   SELECT payload, github_messages.rowid FROM github_messages
-                   JOIN github_accounts ON github_accounts.id = github_messages.channel_id AND app_id = account_id
-                   WHERE github_accounts.workspace_id = ? AND channel_id = ?
-               )
-               SELECT json_extract(payload, '$.conversation_id') AS id FROM messages
-               WHERE json_extract(payload, '$.kind') = ? GROUP BY id ORDER BY max(position) DESC LIMIT 100""",
-            workspace_id,
+            f"""SELECT json_extract(payload, '$.conversation_id') AS id FROM {message_table(account["platform"])}
+                WHERE channel_id = ? AND account_id = ? AND json_extract(payload, '$.kind') = ?
+                GROUP BY id ORDER BY max(rowid) DESC LIMIT 100""",
             channel_id,
-            workspace_id,
-            channel_id,
-            workspace_id,
-            channel_id,
+            account["app_id"],
             kind,
         )
         return [{"id": row["id"]} for row in rows]

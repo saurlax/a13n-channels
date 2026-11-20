@@ -24,9 +24,8 @@ from pydantic_ai.capabilities import Capability
 from pydantic_ai.messages import BinaryContent, ToolReturn
 from sqlalchemy import select
 
-from a13n_channels.messages import ChannelMessage, ReplyText, message_table
-from a13n_channels.qq import ChannelId, QQConnection, QQConversationKind, QQRejected
-from a13n_channels.qq_content import (
+from a13n_channels.channels.qq import ChannelId, QQConnection, QQConversationKind, QQRejected
+from a13n_channels.channels.qq_content import (
     MEDIA_LIMITS,
     QQMedia,
     QQRichContent,
@@ -34,6 +33,7 @@ from a13n_channels.qq_content import (
     open_attachment,
     validate_rich,
 )
+from a13n_channels.messages import ChannelMessage, ReplyText, message_table
 from a13n_channels.routing import select_route
 
 if TYPE_CHECKING:
@@ -292,18 +292,9 @@ class WorkspaceChannelTools(AbstractHarnessPlugin):
             except ServiceError as error:
                 raise ModelRetry(error.message) from None
         rows = await active.store.query(
-            """SELECT id, name, app_id, organization_id, app_secret, intents, 'qq' AS platform
-               FROM qq_accounts WHERE workspace_id = ? AND organization_id = ?
-               UNION ALL
-               SELECT id, name, bot_id, organization_id, NULL, NULL, 'weixin' FROM weixin_accounts
-               WHERE workspace_id = ? AND organization_id = ? AND bot_id IS NOT NULL
-               UNION ALL
-               SELECT id, name, app_id, organization_id, NULL, NULL, platform FROM github_accounts
-               WHERE workspace_id = ? AND organization_id = ? ORDER BY name, id""",
-            scope.workspace_id,
-            scope.organization_id,
-            scope.workspace_id,
-            scope.organization_id,
+            """SELECT id, name, app_id, organization_id, app_secret, intents, platform
+               FROM channel_accounts WHERE workspace_id = ? AND organization_id = ? AND app_id IS NOT NULL
+               ORDER BY name, id""",
             scope.workspace_id,
             scope.organization_id,
         )

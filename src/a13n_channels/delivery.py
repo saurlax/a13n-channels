@@ -29,8 +29,8 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
 from a13n_channels.accounts import Accounts
+from a13n_channels.channels.qq_content import image_type, open_attachment
 from a13n_channels.messages import ChannelMessage, message_table
-from a13n_channels.qq_content import image_type, open_attachment
 from a13n_channels.routing import Route, select_route
 from a13n_channels.tools import DELIVERY_FACTORY_KEY, FACTORY_KEY
 

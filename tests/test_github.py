@@ -7,7 +7,7 @@ from a13n_service.infra.errors import ServiceError
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from a13n_channels.github import GitHubBind, GitHubConnection
+from a13n_channels.channels.github import GitHubBind, GitHubConnection
 from a13n_channels.routing import Route, Source, select_route, validate_route
 
 CURSOR = "2026-11-19T01:00:00Z"

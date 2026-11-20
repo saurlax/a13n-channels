@@ -140,7 +140,7 @@ def incoming(message_id, conversation="user"):
 def test_matched_text_retries_same_submission_and_reuses_source_thread(
     platform, image_case, tmp_path, monkeypatch, published_agent
 ):
-    from a13n_channels.qq_content import QQInbound
+    from a13n_channels.channels.qq_content import QQInbound
 
     async def exercise():
         store = store_for(tmp_path)
@@ -524,7 +524,7 @@ def test_channel_tools_use_trusted_delivery_and_do_not_repeat_a_send(tmp_path, m
     from pydantic_ai import ModelRetry
 
     from a13n_channels import tools
-    from a13n_channels.qq_content import QQInbound, QQMedia
+    from a13n_channels.channels.qq_content import QQInbound, QQMedia
 
     async def exercise():
         store = store_for(tmp_path)
@@ -683,7 +683,7 @@ def test_workspace_channel_tools_share_the_account_allowlist_for_reads_and_sched
     from pydantic_ai import ModelRetry
 
     from a13n_channels import tools
-    from a13n_channels.qq import QQCreate
+    from a13n_channels.channels.qq import QQCreate
 
     async def exercise():
         store = store_for(tmp_path)

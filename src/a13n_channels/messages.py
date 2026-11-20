@@ -39,4 +39,4 @@ def message_table(platform: str) -> str:
         "weixin": "weixin_messages",
         "github": "github_messages",
         "github_app": "github_messages",
-    }[platform]
+    }.get(platform, "connector_messages")

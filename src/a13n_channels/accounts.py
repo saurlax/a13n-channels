@@ -12,12 +12,13 @@ from a13n_service.infra.crypto import Envelope, KeyRing, SecretLocation
 from a13n_service.infra.errors import ServiceError, not_found
 from a13n_service.infra.ids import new_object_id
 
-from a13n_channels.github import GITHUB_KINDS, LOGIN_PATTERN, GitHubBinding
+from a13n_channels.channels.adapter import ChannelError
+from a13n_channels.channels.github import GITHUB_KINDS, LOGIN_PATTERN, GitHubBinding
+from a13n_channels.channels.qq import QQCreate, QQSecret
+from a13n_channels.channels.qq_content import QQInbound
+from a13n_channels.channels.weixin import WeixinCredentials
 from a13n_channels.messages import ChannelMessage
-from a13n_channels.qq import QQCreate, QQSecret
-from a13n_channels.qq_content import QQInbound
 from a13n_channels.routing import SCHEMA, Route, RouteInput, enqueue, github_channel_ids, read_routes, validate_route
-from a13n_channels.weixin import WeixinCredentials
 
 
 class Accounts:
@@ -56,6 +57,16 @@ class Accounts:
                     account_id TEXT NOT NULL, message_id TEXT NOT NULL, payload TEXT NOT NULL,
                     PRIMARY KEY (channel_id, account_id, message_id)
                 );
+                CREATE TABLE IF NOT EXISTS connector_accounts (
+                    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, workspace_id TEXT NOT NULL,
+                    name TEXT NOT NULL, platform TEXT NOT NULL, app_id TEXT NOT NULL,
+                    credentials TEXT NOT NULL, cursor TEXT NOT NULL DEFAULT '', UNIQUE (platform, app_id)
+                );
+                CREATE TABLE IF NOT EXISTS connector_messages (
+                    channel_id TEXT NOT NULL REFERENCES connector_accounts(id) ON DELETE CASCADE,
+                    account_id TEXT NOT NULL, message_id TEXT NOT NULL, payload TEXT NOT NULL, context TEXT,
+                    PRIMARY KEY (channel_id, account_id, message_id)
+                );
             """)
             db.executescript(SCHEMA)
             with db:
@@ -76,6 +87,19 @@ class Accounts:
                     ON channel_deliveries (destination, status)""")
                 self._message_store(db, "qq", "app_id", "reply_sequence INTEGER NOT NULL DEFAULT 0", "reply_sequence")
                 self._message_store(db, "weixin", "bot_id", "context TEXT", "context")
+                db.execute("""CREATE VIEW IF NOT EXISTS channel_accounts AS
+                    SELECT id, organization_id, workspace_id, name, app_id, 'qq' AS platform,
+                           app_secret AS generation, app_secret, intents, '' AS cursor, NULL AS credentials
+                    FROM qq_accounts
+                    UNION ALL
+                    SELECT id, organization_id, workspace_id, name, bot_id, 'weixin',
+                           credentials, NULL, NULL, cursor, credentials FROM weixin_accounts
+                    UNION ALL
+                    SELECT id, organization_id, workspace_id, name, app_id, platform,
+                           credentials, NULL, NULL, cursor, credentials FROM github_accounts
+                    UNION ALL
+                    SELECT id, organization_id, workspace_id, name, app_id, platform,
+                           credentials, NULL, NULL, cursor, credentials FROM connector_accounts""")
 
     @staticmethod
     def _message_store(db: sqlite3.Connection, platform: str, identity: str, column: str, value: str) -> None:
@@ -163,10 +187,8 @@ class Accounts:
                         raise ServiceError("invalid_argument", "Choose an account for each allowed user.")
                     continue
                 if not db.execute(
-                    """SELECT id FROM qq_accounts WHERE id = ? AND workspace_id = ?
-                       UNION ALL SELECT id FROM weixin_accounts WHERE id = ? AND workspace_id = ?
-                       UNION ALL SELECT id FROM github_accounts WHERE id = ? AND workspace_id = ?""",
-                    (channel_id, workspace_id) * 3,
+                    "SELECT id FROM channel_accounts WHERE id = ? AND workspace_id = ?",
+                    (channel_id, workspace_id),
                 ).fetchone():
                     raise ServiceError("invalid_argument", "Choose a channel in this workspace.")
             if any(source.repository and source.channel_id not in github_channels for source in body.sources):
@@ -401,3 +423,51 @@ class Accounts:
             ).rowcount
             if inserted:
                 enqueue(db, account["workspace_id"], account["app_id"], message)
+
+    def connector_credentials(self, account: sqlite3.Row) -> dict[str, str]:
+        return json.loads(
+            self.unseal(
+                account["organization_id"],
+                "channels.connector_accounts",
+                "credentials",
+                account["id"],
+                account["credentials"],
+            )
+        )
+
+    async def receive_connector(
+        self, account: sqlite3.Row, message: ChannelMessage | None, cursor: str | None, context: dict[str, str] | None
+    ) -> None:
+        await asyncio.to_thread(self._receive_connector, account, message, cursor, context)
+
+    def _receive_connector(
+        self, account: sqlite3.Row, message: ChannelMessage | None, cursor: str | None, context: dict[str, str] | None
+    ) -> None:
+        channel_id, account_id = account["id"], account["app_id"]
+        with self.transaction() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute(
+                "SELECT 1 FROM connector_accounts WHERE id = ? AND credentials = ?",
+                (channel_id, account["credentials"]),
+            ).fetchone():
+                raise ChannelError("The channel account changed.", retryable=True)
+            if message is not None:
+                if message.channel_id != channel_id:
+                    raise ValueError("A connector must emit messages for its own account.")
+                private = None
+                if context:
+                    private = self.seal(
+                        account["organization_id"],
+                        "channels.connector_messages",
+                        "context",
+                        f"{channel_id}:{message.id}",
+                        json.dumps(context).encode(),
+                    )
+                inserted = db.execute(
+                    "INSERT OR IGNORE INTO connector_messages VALUES (?, ?, ?, ?, ?)",
+                    (channel_id, account_id, message.id, message.model_dump_json(), private),
+                ).rowcount
+                if inserted:
+                    enqueue(db, account["workspace_id"], account_id, message)
+            if cursor is not None:
+                db.execute("UPDATE connector_accounts SET cursor = ? WHERE id = ?", (cursor, channel_id))

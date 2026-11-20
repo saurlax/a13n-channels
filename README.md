@@ -1,6 +1,6 @@
 # Channels
 
-An a13n Service App for managing QQ bots, Weixin ClawBot, and GitHub delivery in Console. It connects to QQ by outbound WebSocket and Weixin by iLink long polling. Routes deliver incoming messages to Agents and provide tools for reading conversation history and replying through the source channel.
+An a13n Service App for connecting messaging platforms and event sources to Agents. Manage channel accounts and delivery routes in Console. Agent tools read conversation history and reply through the source channel.
 
 ## Prerequisites and compatibility
 
@@ -73,6 +73,22 @@ Choose **GitHub** to connect a user with a classic personal access token. Grant 
 Choose **GitHub App** to connect an installation with its App ID, installation ID, and PEM private key. Install the App on the selected repositories and grant **Issues** and **Pull requests** permissions for the conversations it should handle. Commenting requires write permission. The connector obtains short-lived installation tokens and polls repository activity.
 
 For either mode, select the channel account and choose **All**, **Issue**, or **Pull Request** in the route’s **Sources** table. Enter repositories as `owner/repo` in **Conversation**. In **Filters → Allowed users**, add the account and the GitHub usernames that may trigger the route. Separate usernames with commas. GitHub delivery requires both a matching repository and an allowed sender. Polling covers the repositories configured on active routes. The allowlist applies per account. QQ and Weixin sources accept any sender unless an allowlist is set for their account. Issue and PR descriptions, ordinary comments, and PR review text and inline comments use the same conversation as the parent Issue or PR. The mentions filter recognizes the bound GitHub login or App slug and review requests explicitly assigned to that identity when present in polled activity. The send tool posts an ordinary comment to the originating Issue or PR. Polling coverage depends on GitHub notifications for user accounts and the repository activity returned for App installations.
+
+### Outbound connectors
+
+Choose the platform in **Add channel**, supply the connection credentials, and create a delivery route to a published Agent. Channels keeps one connection per upstream identity in a deployment. Keep the upstream bot or subscription dedicated to this deployment when the platform shares or load-balances events across consumers.
+
+| Platform | Platform setup | Conversation and reply behavior |
+| --- | --- | --- |
+| [Feishu](https://open.feishu.cn/document/ukTMukTMukTM/uYDNxYjL2QTM24iN0EjN/event-subscription-configure-) | Publish a mainland Feishu custom app with the bot capability. Configure long-connection event delivery for `im.message.receive_v1`, and grant the receive and bot-send permissions for the intended chats. Enter the App ID and App Secret. | Private and group chats, including bot mentions. Delivers text and text extracted from posts. Replies to the original message. |
+| [Slack](https://docs.slack.dev/apis/events-api/using-socket-mode/) | Enable Socket Mode. Enter an app-level token with `connections:write` and a bot token with `chat:write`. Subscribe to `app_mention` or the required `message.*` bot events and grant their corresponding scopes. Invite the bot to the channels it needs. | Direct messages and joined channels. Replies in the source Slack thread. App-level sockets share event delivery, so dedicate the Slack app to the intended workspace. |
+| [Discord](https://docs.discord.com/developers/events/gateway) | Add the bot to the server and grant View Channel, Send Messages, and Read Message History. Grant Send Messages in Threads for thread replies. Enter the Bot token. To read ordinary unmentioned guild messages, enable Message Content Intent in the Developer Portal and set the connector field to `true`. | Private and guild messages. Guild threads use their native channel IDs. Replies reference the original message and suppress mention notifications. Gateway resume is in-process. |
+| [DingTalk](https://open-dingtalk.github.io/developerpedia/docs/learn/stream/protocol/) | Enable a bot for an enterprise application and select Stream Mode. Enter its Client ID and Client Secret. | Delivers private and group bot callbacks. Text replies use the original session webhook. If it expires, send a new message to the bot. |
+| [WeCom](https://developer.work.weixin.qq.com/document/path/101463) | Create an intelligent bot with long-connection access and enter its Bot ID and Secret. | Private chats and group events addressed to the bot. Replies use the original callback while its reply window is open and send to the same conversation after it closes. |
+| [Telegram](https://core.telegram.org/bots/api#getupdates) | Enter a BotFather token. Stop any other poller and remove any configured webhook before connecting. Telegram's group privacy mode and bot permissions determine which messages are delivered. | Private chats, groups, and forum topics. Topic routes use `chat_id:message_thread_id`. Replies target the original message and topic. Delivers text and media captions. |
+| [MQTT](https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html) | Enter a public TLS broker hostname, credentials, an inbound topic filter, and a separate reply topic outside the filter. The default TLS port is 8883. Give the broker account subscribe access to the filter and publish access to the reply topic. | Routes use the actual incoming topic, with sender `mqtt`. Payloads are UTF-8. Producers can include a stable JSON `message_id` for deduplication. Retained messages are skipped. Replies are JSON on the configured topic. QoS 1 ACK confirms the broker response. Subscribers confirm receipt separately. Clean sessions have no offline backlog. |
+
+The outbound connectors deliver text and use explicit `channel_send_message` calls for replies. Route filters and allowed senders apply before an Agent runs.
 
 ## Route messages to Agents
 
@@ -153,10 +169,10 @@ Use `reference_message_id` on a reply to quote a stored message from that conver
 ## Where to make changes
 
 - `src/a13n_channels/app.py` registers the workspace account and routing APIs. `routing.py` matches sources, `delivery.py` submits inputs, and `tools.py` implements the conversation tools.
-- `src/a13n_channels/qq.py` implements the QQ Gateway and send APIs. `src/a13n_channels/qq_content.py` defines rich messages and projects incoming QQ content. `src/a13n_channels/accounts.py` owns account and message storage.
+- `src/a13n_channels/channels/` contains platform adapters and their protocol helpers. Register an outbound adapter in `channels/registry.py` with its credential fields and supported conversation types. `connector_accounts.py` and `accounts.py` own account and message storage.
 - `frontend/src/index.tsx` mounts the Channels page in Console. App requests and cache keys are scoped by the host bridge.
 - `pyproject.toml` owns entry-point discovery and wheel/sdist asset packaging.
 
-The WeChat icon is adapted from [Simple Icons](https://simpleicons.org/) (CC0).
+See [channel icon sources and licenses](frontend/src/icons/NOTICE.md).
 
 See [AGENTS.md](AGENTS.md) for project boundaries and Conventional Commit guidance.

@@ -9,12 +9,12 @@ from typing import Annotated, Literal
 from a13n_service.infra.errors import ServiceError
 from pydantic import BaseModel, Field, StringConstraints, model_validator
 
-from a13n_channels.github import GITHUB_KINDS, Login, RepositoryName
+from a13n_channels.channels.github import GITHUB_KINDS, Login, RepositoryName
 from a13n_channels.messages import ChannelMessage
 
 type Choice = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=512)]
 type ThreadPolicy = Literal["conversation", "sender", "fixed", "message"]
-type Kind = Literal["private", "group", "guild", "guild_dm", "channel", "thread", "issue", "pull_request", "*"]
+type Kind = Literal["private", "group", "guild", "guild_dm", "channel", "thread", "issue", "pull_request", "topic", "*"]
 
 SCHEMA = """
     CREATE TABLE IF NOT EXISTS channel_routes (
@@ -54,6 +54,10 @@ SCHEMA = """
         DELETE FROM channel_threads WHERE channel_id = OLD.id;
     END;
     CREATE TRIGGER IF NOT EXISTS github_channel_delivery_delete AFTER DELETE ON github_accounts BEGIN
+        DELETE FROM channel_deliveries WHERE channel_id = OLD.id;
+        DELETE FROM channel_threads WHERE channel_id = OLD.id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS connector_channel_delivery_delete AFTER DELETE ON connector_accounts BEGIN
         DELETE FROM channel_deliveries WHERE channel_id = OLD.id;
         DELETE FROM channel_threads WHERE channel_id = OLD.id;
     END;

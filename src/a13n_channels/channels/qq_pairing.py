@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from a13n_channels.qq import AppId, ChannelId, QQSecret
+from a13n_channels.channels.qq import AppId, ChannelId, QQSecret
 from a13n_channels.qr import qr_image
 
 type LoginId = Annotated[str, Field(pattern=r"^[a-f0-9]{32}$")]

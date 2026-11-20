@@ -8,8 +8,8 @@ import pytest
 from pydantic_ai import Tool
 from pydantic_ai.profiles.google import GoogleJsonSchemaTransformer, GoogleOpenAPISchemaTransformer
 
-from a13n_channels import qq
-from a13n_channels.qq_content import QQArk, QQMarkdown, QQMedia, QQReply, open_attachment
+from a13n_channels.channels import qq
+from a13n_channels.channels.qq_content import QQArk, QQMarkdown, QQMedia, QQReply, open_attachment
 from a13n_channels.tools import ChannelToolFactory, ChannelTools
 
 PNG = b"\x89PNG\r\n\x1a\npayload"

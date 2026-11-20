@@ -15,8 +15,8 @@ from a13n_service.tenancy.authorize import WorkspaceScope
 from pydantic import SecretStr
 
 from a13n_channels import app
+from a13n_channels.channels.weixin import PairingPoll, WeixinCreate
 from a13n_channels.messages import TextReply
-from a13n_channels.weixin import PairingPoll, WeixinCreate
 
 
 def test_weixin_pairing_and_text_exchange(monkeypatch, tmp_path):

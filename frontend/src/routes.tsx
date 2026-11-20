@@ -25,7 +25,7 @@ const english = {
   wakeAgent: "Wake Agent", noWakeAgent: "None",
   wakeHelp: "Decides whether matching messages reach the target Agent. Configure the criteria in the wake Agent’s instructions.",
   wakeError: "Choose a different published Agent in this workspace.",
-  issue: "Issue", pullRequest: "Pull Request", channelKind: "Channel", thread: "Thread", allKinds: "All conversation types",
+  issue: "Issue", pullRequest: "Pull Request", channelKind: "Channel", thread: "Thread", topic: "MQTT topic", allKinds: "All conversation types",
   cancel: "Cancel", save: "Save", remove: "Delete", deleteTitle: "Delete route",
   deleteError: "The route could not be deleted. Try again.",
   deleteBody: "New messages will stop using this route. Existing Console conversations are retained.",
@@ -66,7 +66,7 @@ const chinese: typeof english = {
   wakeAgent: "唤醒 Agent", noWakeAgent: "不使用",
   wakeHelp: "决定匹配的消息是否交给目标 Agent。判断条件写在唤醒 Agent 的指令里。",
   wakeError: "请选择当前工作区内另一个已发布的 Agent。",
-  issue: "Issue", pullRequest: "Pull Request", channelKind: "频道", thread: "话题", allKinds: "全部会话类型",
+  issue: "Issue", pullRequest: "Pull Request", channelKind: "频道", thread: "话题", topic: "MQTT 主题", allKinds: "全部会话类型",
   cancel: "取消", save: "保存", remove: "删除", deleteTitle: "删除路由",
   deleteError: "未能删除路由，请重试。",
   deleteBody: "新消息将不再使用这条路由。已有的 Console 会话会保留。",
@@ -158,6 +158,7 @@ function kindName(kind: string, text: Text) {
     case "guild_dm": return text.guild_dm;
     case "channel": return text.channelKind;
     case "thread": return text.thread;
+    case "topic": return text.topic;
     case "issue": return text.issue;
     case "pull_request": return text.pullRequest;
     default: return kind;

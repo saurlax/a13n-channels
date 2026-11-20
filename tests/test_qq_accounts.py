@@ -14,9 +14,9 @@ from a13n_service.tenancy.authorize import WorkspaceScope
 from pydantic import SecretStr
 
 from a13n_channels import app
+from a13n_channels.channels.qq import QQCreate
+from a13n_channels.channels.qq_content import QQMedia, QQReply
 from a13n_channels.messages import ChannelMessage
-from a13n_channels.qq import QQCreate
-from a13n_channels.qq_content import QQMedia, QQReply
 
 
 def test_qq_accounts_and_messages_are_owned_by_the_workspace(tmp_path, monkeypatch):

@@ -21,3 +21,9 @@ a13n-channels adds a Channels tab to a13n Console. The App owns channel accounts
 
 - Use `make setup` to prepare the environment pinned by `.service-ref`. Use `make check` for Python lint and formatting, `make test` for focused behavior, and `make verify` for wheel, sdist, and installed-wheel checks. When adopting a new Service API, update the pin deliberately and use a matching host checkout.
 - Use [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) in English. Use `type(scope): description` or `type: description`, with a short imperative description. Examples include `feat(console): add channel account list`, `fix(api): enforce route workspace scope`, and `docs: describe local setup`.
+
+## Channel adapters
+
+- Put platform protocol modules in `src/a13n_channels/channels/`. Export an `ADAPTER` using `channels/adapter.py` for new outbound connections. Keep account storage, authorization, routing, and Run delivery in the shared application. Register each adapter once for account forms, routing, ingestion, and replies.
+- Bind one stable upstream bot or subscription identity per account. Enqueue normalized `ChannelMessage` values using stable upstream event IDs. Persist cursor changes with ingestion when a platform supplies a durable cursor. Pass private reply material through the encrypted context argument and omit it from normalized message data and logs.
+- Use stable conversation IDs and platform-native reply destinations. Ignore self-generated events, honor platform rate limits, and make listening cancellable. Report a positive send result only after the platform acknowledges it. Test wire envelopes and routing through the shared host, and identify the platforms that still need live account validation.
