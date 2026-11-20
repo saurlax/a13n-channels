@@ -40,7 +40,7 @@ flowchart LR
 
         subgraph plugin["a13n-channels plugin"]
             adapters[Channel adapters]
-            routers["Routers<br/>Filters and routing"]
+            routers["Delivery routes<br/>Filters and routing"]
             history[("Workspace<br/>message history")]
 
             adapters --> routers
