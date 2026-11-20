@@ -47,6 +47,7 @@ def token_response():
 def test_gemini_tool_schema_keeps_native_qq_card_and_button_fields(transformer):
     plugin = ChannelTools("channels", ChannelToolFactory())
     schema = transformer(Tool(plugin.channel_send_message).function_schema.json_schema).walk()
+    assert "message_id" not in schema["properties"]
     rendered = json.dumps(schema)
     for field in ("specify_user_ids", "render_data", "obj_kv", "template_id", "thumbnail"):
         assert f'"{field}"' in rendered

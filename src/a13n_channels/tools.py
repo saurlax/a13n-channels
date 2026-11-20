@@ -421,20 +421,21 @@ class ChannelTools(AbstractHarnessPlugin):
                 id=self.plugin_id,
                 instructions="Use channel_send_message to reply in the originating chat. Normal assistant text is "
                 "shown only in Console. Use channel_list_messages to inspect recent chat context. "
-                "Pass the message_id from Channel source to select which input to read or reply to. "
-                "Use channel_view_attachment to inspect QQ images and stickers or save other files. "
+                "Replies use the message that started the run. "
+                "When reading, use the message_id from Channel source to select the input. "
+                "Use channel_get_attachment to inspect QQ images and stickers or save other files. "
                 "To send a generated image or sticker, pass rich={type:'media',path:'/absolute/environment/path'} "
                 "to channel_send_message.",
                 tools=[
                     Tool(self.channel_list_messages),
                     Tool(self.channel_get_message),
-                    Tool(self.channel_view_attachment),
+                    Tool(self.channel_get_attachment),
                     Tool(self.channel_send_message),
                 ],
             )
         ]
 
-    async def source(self, ctx: RunContext[AgentContext], message_id: str | None):
+    async def source(self, ctx: RunContext[AgentContext], message_id: str | None = None, *, from_trigger: bool = False):
         active = self.factory.channels
         if active is None:
             raise ModelRetry("Channels is not configured on this Service.")
@@ -445,20 +446,21 @@ class ChannelTools(AbstractHarnessPlugin):
             while origin.trigger == "resume" and origin.parent_run_id:
                 origin = await session.get_one(RunRow, origin.parent_run_id)
                 origins.append(origin.id)
-            keys = list(
-                await session.scalars(
-                    select(InboxEntryRow.request_key).where(
-                        InboxEntryRow.assigned_run_id.in_(origins),
-                        InboxEntryRow.kind == "message",
-                        InboxEntryRow.status.in_(("assigned", "consumed")),
-                        InboxEntryRow.request_key.startswith("channels-"),
-                    )
-                )
+            entries = select(InboxEntryRow.request_key).where(
+                InboxEntryRow.assigned_run_id.in_(origins),
+                InboxEntryRow.kind == "message",
+                InboxEntryRow.status.in_(("assigned", "consumed")),
+                InboxEntryRow.request_key.startswith("channels-"),
             )
+            if from_trigger:
+                entries = entries.where(InboxEntryRow.id == origin.source_entry_id)
+            keys = list(await session.scalars(entries))
             workspace_id, principal_id, agent_id = run.workspace_id, run.principal_id, run.agent_id
             authority = ExecutionAuthority.model_validate(run.authority)
 
         if not keys:
+            if from_trigger:
+                raise ModelRetry("Replies require a run started by a channel message.")
             raise ModelRetry("Channel tools require a run with a channel delivery.")
         placeholders = ", ".join("?" for _ in keys)
         rows = await active.store.query(
@@ -525,7 +527,7 @@ class ChannelTools(AbstractHarnessPlugin):
         active, account, job = await self.source(ctx, message_id)
         return await read_messages(active.store, account, job["kind"], job["conversation_id"], limit)
 
-    async def channel_view_attachment(
+    async def channel_get_attachment(
         self,
         ctx: RunContext[AgentContext],
         index: AttachmentIndex,
@@ -561,12 +563,11 @@ class ChannelTools(AbstractHarnessPlugin):
         self,
         ctx: RunContext[AgentContext],
         text: ReplyText | None = None,
-        message_id: MessageId | None = None,
         rich: QQRichContent | None = None,
         reference_message_id: MessageId | None = None,
     ) -> dict:
-        """Reply to the source chat. QQ supports media, Markdown, and cards. Quote a message with reference_message_id."""
-        active, account, job = await self.source(ctx, message_id)
+        """Reply to the message that started this run. QQ supports rich content and reference_message_id quotes."""
+        active, account, job = await self.source(ctx, from_trigger=True)
         if ctx.tool_call_id is None:
             raise ModelRetry("A recorded tool call is required to send a message.")
         if account["platform"] != "qq" and (rich is not None or reference_message_id is not None):
@@ -609,7 +610,7 @@ class ChannelTools(AbstractHarnessPlugin):
         try:
             data = await prepare_qq_send(ctx, job["kind"], text, rich)
             if data is not None:
-                _, account, _ = await self.source(ctx, job["message_id"])
+                _, account, _ = await self.source(ctx, from_trigger=True)
             reference_id = None
             if reference_message_id is not None:
                 quoted = await history_message(

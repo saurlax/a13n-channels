@@ -82,11 +82,14 @@ def received_url(value: object) -> str | None:
 
 
 @asynccontextmanager
-async def open_attachment(url: str, authorize_url: Callable[[str], None]) -> AsyncIterator[httpx.Response]:
+async def open_attachment(
+    url: str, authorize_url: Callable[[str], None] | None = None
+) -> AsyncIterator[httpx.Response]:
     """Pin a public address at every hop while preserving the origin's TLS and Host identity."""
     for _ in range(4):
         url = media_url(url)
-        authorize_url(url)
+        if authorize_url is not None:
+            authorize_url(url)
         target = httpx.URL(url)
         addresses = await asyncio.get_running_loop().getaddrinfo(
             target.raw_host.decode("ascii"), 443, type=socket.SOCK_STREAM

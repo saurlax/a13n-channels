@@ -109,10 +109,10 @@ Channel delivery adds these Harness tools to the target Agent for that run:
 
 - `channel_list_messages` reads recent incoming messages and attachment metadata from the originating conversation.
 - `channel_get_message` reads one full stored message, including expanded forwards and structured content.
-- `channel_view_attachment` views a QQ image or sticker, or saves a QQ attachment into the Agent Environment.
-- `channel_send_message` sends text or QQ rich content to the originating conversation. QQ and Weixin use the original message's reply context.
+- `channel_get_attachment` views a QQ image or sticker, or saves a QQ attachment into the Agent Environment.
+- `channel_send_message` replies to the message that started the Run. It accepts text or QQ rich content. QQ and Weixin use that message's reply context.
 
-When a Run receives multiple channel messages, pass the intended message ID to the tools to select its conversation. Assistant text stays in Console. A channel reply requires a send tool call. The tools resolve the conversation from the run's delivery record and require a currently enabled route and account. They are available to the target Agent during channel delivery. Failed deliveries and unconfirmed sends appear in route status. A replay of the same send call never resends an unconfirmed reply.
+When a Run receives multiple channel messages, use the intended message ID to select the conversation for reads. The reply tool selects the triggering message even when later inputs steer the same Run. Assistant text stays in Console. The tools resolve the conversation from the Run's delivery record and require a currently enabled route and account. Failed deliveries and unconfirmed sends appear in route status. A replay of the same send call never resends an unconfirmed reply.
 
 ### Read history and send proactive QQ messages
 
@@ -142,7 +142,9 @@ Use `channel_send_message` with `rich` set to one of the following objects. `cha
 
 An image can include `text` as a caption. Send captions for other media separately. QQ C2C and group sends upload bytes or a URL to obtain a media receipt. Large files use QQ's multipart upload flow. Guild and guild DM media use the image field or an image file. The QQ reply API accepts the same text and rich message objects with HTTPS URLs for media. QQ controls availability of file types, custom cards, keyboards, quotes, and proactive messages for each bot and conversation.
 
-QQ history preserves images, custom sticker markers, emoji labels, audio, video, files, quotes, cards, and forwarded chat records supplied in Gateway events. Attachment URLs stay private. Pass `message_id` and the reported one-based `index` to `channel_view_attachment` to inspect an image or sticker. Supply an absolute Environment `save_path` for other attachments or to save a larger image. For older messages in the same conversation, identify the current delivery with `source_message_id`. Temporary QQ links can expire. A fresh message supplies a new link.
+QQ history preserves images, custom sticker markers, emoji labels, audio, video, files, quotes, cards, and forwarded chat records supplied in Gateway events. Attachment URLs stay private. Pass `message_id` and the reported one-based `index` to `channel_get_attachment` to inspect an image or sticker. Supply an absolute Environment `save_path` for other attachments or to save a larger image. For older messages in the same conversation, identify the current delivery with `source_message_id`. Temporary QQ links can expire. A fresh message supplies a new link.
+
+When an incoming QQ message has one to four images or stickers totaling at most 10 MiB, Channels includes them with the text as image inputs for a vision-capable target model. The route owner needs current workspace write access to create the image Assets. These Assets follow Service's workspace visibility and retention rules. Messages with more images, unavailable images, or a text-only model still deliver text and attachment metadata. Files, videos, and audio download on demand through `channel_get_attachment`.
 
 Use `reference_message_id` on a reply to quote a stored message from that conversation when QQ supplies a reference identifier. To share a forwarded record's contents, send its text or a Markdown recap. QQ callback buttons and quick menus deliver an interaction to the matching route and use the event's native reply context. The bot needs the interaction intent enabled for those callbacks.
 

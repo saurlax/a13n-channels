@@ -9,25 +9,35 @@ from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from secrets import token_hex
 
+import httpx
+from a13n_harness import ModelCapability
 from a13n_service.infra.db import short_session
 from a13n_service.infra.errors import ServiceError
 from a13n_service.resources.agents import service as agents
 from a13n_service.resources.agents.toolsets import default_toolsets
+from a13n_service.resources.assets import service as assets
+from a13n_service.resources.assets.schemas import AssetCreate
+from a13n_service.resources.models.service import resolve_model
+from a13n_service.resources.uploads import service as uploads
 from a13n_service.runs import entries, runs, submit
 from a13n_service.runs.runtime import Runtime
 from a13n_service.runs.schemas import Message, NewThread
 from a13n_service.runs.tables import RunRow
 from a13n_service.tenancy.access import principal_for
-from a13n_service.tenancy.authorize import Principal, WorkspaceScope, authorize
+from a13n_service.tenancy.authorize import Principal, WorkspaceScope, allowed_verbs, authorize
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
 from a13n_channels.accounts import Accounts
 from a13n_channels.messages import ChannelMessage, message_table
+from a13n_channels.qq_content import image_type, open_attachment
 from a13n_channels.routing import Route, select_route
 from a13n_channels.tools import DELIVERY_FACTORY_KEY, FACTORY_KEY
 
 log = logging.getLogger(__name__)
+INLINE_IMAGE_COUNT = 4
+INLINE_IMAGE_BYTES = 10 << 20
+INLINE_IMAGE_TIMEOUT = 10
 
 
 class Deliveries:
@@ -129,7 +139,8 @@ class Deliveries:
         if not rows:
             await self.finish(job, "stopped")
             return
-        message = ChannelMessage.model_validate_json(rows[0]["payload"])
+        payload = json.loads(rows[0]["payload"])
+        message = ChannelMessage.model_validate(payload)
         route = select_route(
             routes,
             job["channel_id"],
@@ -149,7 +160,7 @@ class Deliveries:
                 case "wake_submitted" | "submitted":
                     await self.collect(job, actor)
                 case "queued":
-                    await self.submit(job, account, actor, route, message)
+                    await self.submit(job, account, actor, route, message, qq_context=payload.get("qq_context"))
         except ServiceError as error:
             if error.code in {"unavailable", "internal", "rate_limited", "unauthenticated", "forbidden"}:
                 await self.later(job, 30, f"service:{error.code}")
@@ -218,7 +229,14 @@ class Deliveries:
         )
 
     async def submit(
-        self, job: sqlite3.Row, account: sqlite3.Row, actor: Principal, route: Route, message: ChannelMessage
+        self,
+        job: sqlite3.Row,
+        account: sqlite3.Row,
+        actor: Principal,
+        route: Route,
+        message: ChannelMessage,
+        *,
+        qq_context: str | None,
     ) -> None:
         platform = account["platform"]
         scope = None
@@ -276,6 +294,10 @@ class Deliveries:
             revision = await agents.get_revision(
                 self.runtime.storage, actor, job["workspace_id"], agent.id, agent.default_revision_id
             )
+            if platform == "qq" and qq_context and message.attachments:
+                body["payload"]["content"].extend(
+                    await self.inline_images(job, account, actor, revision.config.model, message, qq_context)
+                )
             plugins = [
                 p.model_dump(mode="json") for p in revision.config.plugins if p.plugin_key != DELIVERY_FACTORY_KEY
             ]
@@ -322,6 +344,81 @@ class Deliveries:
                 request_key=key,
             )
         await asyncio.to_thread(self.save_receipt, job, scope, receipt.thread.id, receipt.entry.id)
+
+    async def inline_images(
+        self,
+        job: sqlite3.Row,
+        account: sqlite3.Row,
+        actor: Principal,
+        model_key: str,
+        message: ChannelMessage,
+        qq_context: str,
+    ) -> list[dict[str, str]]:
+        images = [
+            (index, attachment)
+            for index, attachment in enumerate(message.attachments, start=1)
+            if attachment.kind in {"image", "sticker"}
+        ]
+        if not 1 <= len(images) <= INLINE_IMAGE_COUNT or sum(item.size or 0 for _, item in images) > INLINE_IMAGE_BYTES:
+            return []
+
+        scope = WorkspaceScope(account["organization_id"], job["workspace_id"])
+        try:
+            async with short_session(self.runtime.storage) as session:
+                writer = await principal_for(session, self.runtime.access, actor.id, confinement=scope)
+                if "write" not in allowed_verbs(writer, scope):
+                    return []
+                model = await resolve_model(session, actor, scope, model_key)
+            if ModelCapability.IMAGE_UNDERSTANDING not in model.config.characteristics.capabilities:
+                return []
+
+            urls = self.store.qq_message_context(account, message.id, qq_context)["urls"]
+            remaining = INLINE_IMAGE_BYTES
+            downloaded = []
+            async with asyncio.timeout(INLINE_IMAGE_TIMEOUT):
+                for index, _ in images:
+                    data = bytearray()
+                    async with open_attachment(urls[index - 1]) as response:
+                        if (
+                            response.status_code != 200
+                            or response.headers.get("Content-Encoding", "identity").lower() != "identity"
+                        ):
+                            return []
+                        length = response.headers.get("Content-Length")
+                        if length is not None and int(length) > remaining:
+                            return []
+                        async for chunk in response.aiter_bytes():
+                            remaining -= len(chunk)
+                            if remaining < 0:
+                                return []
+                            data.extend(chunk)
+                    content = bytes(data)
+                    downloaded.append((index, image_type(content), content))
+
+            parts = []
+            for index, media_type, content in downloaded:
+                name = f"qq-image-{index}.{media_type.removeprefix('image/')}"
+                upload = await uploads.stage(
+                    self.runtime.storage,
+                    self.runtime.objects,
+                    writer,
+                    scope.workspace_id,
+                    request_key=f"channels-image-{job['id']}-{index}",
+                    filename=name,
+                    content_type=media_type,
+                    content=content,
+                )
+                asset, _ = await assets.create_asset(
+                    self.runtime.storage,
+                    writer,
+                    scope.workspace_id,
+                    AssetCreate(upload_id=upload.upload_id, name=name),
+                )
+                parts.append({"type": "asset", "asset_id": asset.id})
+            return parts
+        except (ServiceError, httpx.HTTPError, OSError, TimeoutError, ValueError, KeyError, IndexError) as error:
+            log.info("QQ images not attached for delivery %s (%s)", job["id"], type(error).__name__)
+            return []
 
     def save_receipt(
         self, job: sqlite3.Row, scope: tuple[str, str, str, str, str] | None, thread_id: str, entry_id: str

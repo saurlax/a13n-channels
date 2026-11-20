@@ -4,7 +4,9 @@ import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
+import httpx
 import pytest
+from a13n_harness import ModelCapability
 from a13n_service.infra.crypto import KeyRing
 from a13n_service.infra.errors import ServiceError
 from a13n_service.runs.schemas import NewThread
@@ -19,7 +21,7 @@ from a13n_channels.routing import RouteInput, Source, select_route
 
 
 def channel_input(message):
-    (part,) = message.payload.content
+    part = message.payload.content[0]
     header, text = part.text.split("\n\nMessage:\n", 1)
     return json.loads(header.splitlines()[0].removeprefix("Channel source: ")), text
 
@@ -105,7 +107,7 @@ def published_agent(monkeypatch):
         )
 
     async def revision(_storage, _actor, _workspace, _agent_id, revision_id):
-        return SimpleNamespace(id=revision_id, config=SimpleNamespace(plugins=[]))
+        return SimpleNamespace(id=revision_id, config=SimpleNamespace(model="model", plugins=[]))
 
     monkeypatch.setattr(delivery.agents, "get_agent", agent)
     monkeypatch.setattr(delivery.agents, "get_revision", revision)
@@ -123,9 +125,20 @@ def incoming(message_id, conversation="user"):
     )
 
 
-@pytest.mark.parametrize("platform", ["qq", "weixin"])
+@pytest.mark.parametrize(
+    ("platform", "image_case"),
+    [
+        ("qq", "inline"),
+        ("qq", "too_many"),
+        ("qq", "too_large"),
+        ("qq", "unavailable"),
+        ("qq", "text_only"),
+        ("qq", "read_run_only"),
+        ("weixin", None),
+    ],
+)
 def test_matched_text_retries_same_submission_and_reuses_source_thread(
-    platform, tmp_path, monkeypatch, published_agent
+    platform, image_case, tmp_path, monkeypatch, published_agent
 ):
     from a13n_channels.qq_content import QQInbound
 
@@ -160,11 +173,20 @@ def test_matched_text_retries_same_submission_and_reuses_source_thread(
         assert await store.query("SELECT * FROM channel_deliveries") == []
         first = incoming("first")
         if platform == "qq":
+            count = 5 if image_case == "too_many" else 4
+            attachments = [
+                {"kind": "image", "media_type": "image/png", "filename": f"photo-{index}.png"} for index in range(count)
+            ]
+            urls = [f"https://qq.example.com/photo-{index}.png?rkey=private" for index in range(count)]
+            if image_case == "too_large":
+                attachments[0]["size"] = delivery.INLINE_IMAGE_BYTES + 1
+            attachments.insert(1, {"kind": "file", "media_type": "application/pdf", "filename": "document.pdf"})
+            urls.insert(1, "https://qq.example.com/document.pdf?rkey=private")
             first = QQInbound.model_validate(
                 {
                     **first.model_dump(),
-                    "attachments": [{"kind": "image", "media_type": "image/png", "filename": "photo.png"}],
-                    "attachment_urls": ["https://qq.example.com/photo.png?rkey=private"],
+                    "attachments": attachments,
+                    "attachment_urls": urls,
                     "structured": {"record": True},
                 }
             )
@@ -177,8 +199,11 @@ def test_matched_text_retries_same_submission_and_reuses_source_thread(
         posts = {}
         attempts = []
         access = object()
-        runtime = SimpleNamespace(access=access, storage=object())
+        runtime = SimpleNamespace(access=access, storage=object(), objects=object())
         owner_active = False
+        downloads = []
+        uploads = []
+        created_assets = []
 
         @asynccontextmanager
         async def session(storage):
@@ -189,7 +214,33 @@ def test_matched_text_retries_same_submission_and_reuses_source_thread(
             assert current_access is access and principal_id == "owner"
             assert confinement.workspace_id == "workspace" and confinement.organization_id == "org"
             verbs = frozenset({"admin", "write", "read", "run"} if owner_active else {"read"})
+            if owner_active and image_case == "read_run_only":
+                verbs = frozenset({"read", "run"})
             return Principal(principal_id, "user", (Grant("org", None, verbs),), confinement)
+
+        async def model(_session, _actor, _scope, key):
+            assert key == "model"
+            capabilities = [] if image_case == "text_only" else [ModelCapability.IMAGE_UNDERSTANDING]
+            return SimpleNamespace(config=SimpleNamespace(characteristics=SimpleNamespace(capabilities=capabilities)))
+
+        @asynccontextmanager
+        async def download(url):
+            downloads.append(url)
+            status = 404 if image_case == "unavailable" and len(downloads) == 2 else 200
+            yield httpx.Response(status, content=b"\x89PNG\r\n\x1a\npayload")
+
+        async def stage(storage, objects, actor, workspace_id, *, request_key, filename, content_type, content):
+            assert storage is runtime.storage and objects is runtime.objects
+            assert workspace_id == "workspace" and actor.id == "owner"
+            assert "write" in allowed_verbs(actor, actor.confinement)
+            assert content_type == "image/png" and content.startswith(b"\x89PNG")
+            uploads.append((request_key, filename))
+            return SimpleNamespace(upload_id="upl_" + f"{len(uploads):032x}")
+
+        async def create_asset(_storage, _actor, _workspace, body):
+            asset = SimpleNamespace(id="ast_" + body.upload_id.removeprefix("upl_"))
+            created_assets.append(asset.id)
+            return asset, True
 
         def record(host, actor, workspace_id, message, path, key):
             assert host is runtime and actor.id == "owner" and workspace_id == "workspace"
@@ -204,6 +255,12 @@ def test_matched_text_retries_same_submission_and_reuses_source_thread(
                 assert 'Channel attachments: [{"index": 1' in message.payload.content[0].text
                 assert 'Channel structure: {"record": true}' in message.payload.content[0].text
                 assert "rkey=private" not in message.payload.content[0].text
+            parts = message.payload.content[1:]
+            if image_case == "inline" and identifier == "first":
+                assert [part.asset_id for part in parts] == created_assets
+                assert len(parts) == 4
+            else:
+                assert not parts
             invocation = (identifier, path, key, message)
             attempts.append(invocation)
             if key in posts:
@@ -235,6 +292,10 @@ def test_matched_text_retries_same_submission_and_reuses_source_thread(
 
         monkeypatch.setattr(delivery, "short_session", session)
         monkeypatch.setattr(delivery, "principal_for", owner)
+        monkeypatch.setattr(delivery, "resolve_model", model)
+        monkeypatch.setattr(delivery, "open_attachment", download)
+        monkeypatch.setattr(delivery.uploads, "stage", stage)
+        monkeypatch.setattr(delivery.assets, "create_asset", create_asset)
         monkeypatch.setattr(delivery.submit, "create_thread", create)
         monkeypatch.setattr(delivery.submit, "submit_message", append)
         monkeypatch.setattr(delivery.entries, "get_entry", read_entry)
@@ -256,6 +317,9 @@ def test_matched_text_retries_same_submission_and_reuses_source_thread(
 
         first_posts = [item for item in attempts if item[0] == "first"]
         assert len(first_posts) == 2 and first_posts[0] == first_posts[1]
+        assert len(downloads) == {"inline": 4, "unavailable": 2}.get(image_case, 0)
+        assert all(".png?" in url for url in downloads)
+        assert len(uploads) == (4 if image_case == "inline" else 0)
         assert next(item[1] for item in attempts if item[0] == "second") == "/threads/thread-user/inbox"
         assert next(item[1] for item in attempts if item[0] == "other-source") == "/threads"
         assert {job["status"] for job in await store.query("SELECT status FROM channel_deliveries")} == {"completed"}
@@ -507,15 +571,17 @@ def test_channel_tools_use_trusted_delivery_and_do_not_repeat_a_send(tmp_path, m
             source_entry_id="entry",
             authority=authority,
         )
-        keys = ["channels-trusted"]
+        keys = {"entry": "channels-trusted"}
 
         class Session:
             async def get(self, model, _id):
                 assert model is tools.RunRow
                 return run
 
-            async def scalars(self, _statement):
-                return keys
+            async def scalars(self, statement):
+                if "entry" in statement.compile().params.values():
+                    return [keys["entry"]] if "entry" in keys else []
+                return list(keys.values())
 
         @asynccontextmanager
         async def session(_storage):
@@ -580,10 +646,10 @@ def test_channel_tools_use_trusted_delivery_and_do_not_repeat_a_send(tmp_path, m
         full_message = await plugin.channel_get_message(ctx, "source")
         assert full_message["structured"]["record"] and "qq_context" not in full_message
         assert full_message["attachments"][0]["filename"] == "photo.png"
-        image = await plugin.channel_view_attachment(ctx, 1, "source")
+        image = await plugin.channel_get_attachment(ctx, 1, "source")
         assert image.content[0].data == png and downloads == [url]
         with pytest.raises(ModelRetry, match="selected conversation"):
-            await plugin.channel_view_attachment(ctx, 1, "other-chat", source_message_id="source")
+            await plugin.channel_get_attachment(ctx, 1, "other-chat", source_message_id="source")
         assert downloads == [url]
         ctx.tool_call_id = "rich"
         photo = QQMedia(type="media", path="/agent/photo.png")
@@ -594,15 +660,16 @@ def test_channel_tools_use_trusted_delivery_and_do_not_repeat_a_send(tmp_path, m
         assert not await store.query("SELECT text FROM channel_sends WHERE text LIKE '%photo.png%'")
         ctx.tool_call_id = "call"
         await store.query("UPDATE channel_deliveries SET tool_key = 'channels-second' WHERE message_id = 'other-chat'")
-        keys.append("channels-second")
-        with pytest.raises(ModelRetry, match="Multiple channel messages"):
-            await plugin.channel_send_message(ctx, "reply")
+        keys["steered-entry"] = "channels-second"
+        assert await plugin.channel_send_message(ctx, "reply") == receipt
+        assert len(sent) == 2
         assert [message["id"] for message in await plugin.channel_list_messages(ctx, message_id="other-chat")] == [
             "other-chat"
         ]
-        assert await plugin.channel_send_message(ctx, "second reply", message_id="other-chat") == receipt
-        assert sent[-1] == ("other-chat", "second reply")
-        keys[:] = ["channels-fabricated"]
+        ctx.tool_call_id = "second-call"
+        assert await plugin.channel_send_message(ctx, "second reply") == receipt
+        assert sent[-1] == ("source", "second reply")
+        keys["entry"] = "channels-fabricated"
         with pytest.raises(ModelRetry, match="no longer active"):
             await plugin.channel_send_message(ctx, "reply")
 
