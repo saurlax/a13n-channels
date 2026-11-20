@@ -107,7 +107,7 @@ def test_github_route_filter_requires_both_repository_and_user():
         channel_id="github-test",
         kind="issue",
         conversation_id="*",
-        github_filter={"repositories": ["Owner/Repo"], "users": ["Alice"]},
+        repository="Owner/Repo",
     )
     route = Route(
         id="test",
@@ -116,19 +116,10 @@ def test_github_route_filter_requires_both_repository_and_user():
         name="Test",
         agent_id="agent",
         sources=[source],
+        allowed_users={"github-test": ["Alice"]},
     )
-    other = route.model_copy(
-        update={
-            "id": "other",
-            "sources": [
-                source.model_copy(update={"github_filter": source.github_filter.model_copy(update={"users": ["bob"]})})
-            ],
-        }
-    )
+    other = route.model_copy(update={"id": "other", "allowed_users": {"github-test": ["bob"]}})
     validate_route(other, [route], other.id, {"github-test"})
-    combined = route.model_copy(update={"sources": [source, *other.sources]})
-    validate_route(combined, [], combined.id, {"github-test"})
-    assert select_route([combined], "github-test", "issue", "owner/repo#7", sender_id="bob") == combined
     with pytest.raises(ServiceError, match="already belongs"):
         validate_route(route, [route], "duplicate", {"github-test"})
     assert select_route([route, other], "github-test", "issue", "owner/repo#7", sender_id="ALICE") == route
@@ -137,7 +128,7 @@ def test_github_route_filter_requires_both_repository_and_user():
     assert select_route([route], "github-test", "issue", "owner/repo#7", sender_id="unknown") is None
     assert (
         select_route(
-            [route.model_copy(update={"sources": [source.model_copy(update={"github_filter": None})]})],
+            [route.model_copy(update={"sources": [source.model_copy(update={"repository": None})]})],
             "github-test",
             "issue",
             "owner/repo#7",

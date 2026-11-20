@@ -18,7 +18,6 @@ GITHUB_KINDS = ("issue", "pull_request")
 type GitHubPlatform = Literal["github", "github_app"]
 type RepositoryName = Annotated[str, StringConstraints(max_length=150, pattern=r"^[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+$")]
 LOGIN_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}$"
-type Login = Annotated[str, StringConstraints(pattern=LOGIN_PATTERN)]
 
 
 def stamp() -> str:

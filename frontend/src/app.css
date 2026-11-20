@@ -320,12 +320,30 @@
   font-size: var(--a13n-text-sm);
 }
 
-.a13n-route-cell {
-  overflow-wrap: anywhere;
+.a13n-route-source-summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 220px;
+}
+
+.a13n-route-source-badge {
+  min-width: 0;
+  flex-shrink: 1;
+}
+
+.a13n-route-source-badge > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.a13n-route-source-badge .a13n-channel-icon {
+  width: 14px;
+  height: 14px;
 }
 
 .a13n-route-source-count {
-  margin-inline-start: 6px;
+  flex: none;
   color: var(--a13n-secondary);
   white-space: nowrap;
 }
@@ -442,10 +460,6 @@
   border-top: 1px solid var(--a13n-border);
 }
 
-.a13n-route-source-action button {
-  font-size: 18px;
-}
-
 .a13n-route-source-table .a13n-route-source-action {
   padding-inline: 4px;
 }
@@ -521,7 +535,6 @@
 .dark .a13n-channel-icon:is([data-platform="github"], [data-platform="github_app"]) {
   filter: brightness(0) invert(1);
 }
-
 
 .dark .a13n-channel-icon[data-platform="mqtt"] {
   filter: brightness(2);

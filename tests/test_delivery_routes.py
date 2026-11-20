@@ -854,7 +854,7 @@ def test_repository_sources_and_account_allowlists_round_trip(tmp_path):
     asyncio.run(exercise())
 
 
-def test_legacy_github_route_preserves_wildcard_account_scope_on_save(tmp_path):
+def test_obsolete_github_route_cannot_deliver_or_be_enabled(tmp_path):
     async def exercise():
         store = store_for(tmp_path)
         await store.initialize()
@@ -867,13 +867,11 @@ def test_legacy_github_route_preserves_wildcard_account_scope_on_save(tmp_path):
                 "INSERT INTO channel_routes VALUES ('legacy', 'workspace', 'Legacy', 'agent', 1, ?, 'binding', 'owner')",
                 (json.dumps(config),),
             )
-        (before,) = await store.routes("workspace")
-        body = RouteInput.model_validate(before.model_dump())
-        await store.save_route("workspace", "legacy", body, principal_id="owner", create=False)
         routes = await store.routes("workspace")
-        assert routes == [before]
-        assert select_route(routes, "gh", "issue", "owner/repo#7", sender_id="alice") == before
-        assert select_route(routes, "gh", "issue", "owner/repo#7", sender_id="bob") is None
-        assert select_route(routes, "gh", "pull_request", "owner/repo#7", sender_id="alice") is None
+        assert select_route(routes, "gh", "issue", "owner/repo#7", sender_id="alice") is None
+        (before,) = routes
+        with pytest.raises(ServiceError, match="allowed users"):
+            body = RouteInput.model_validate(before.model_dump())
+            await store.save_route("workspace", "legacy", body, principal_id="owner", create=False)
 
     asyncio.run(exercise())

@@ -164,15 +164,14 @@ class Accounts:
                 raise not_found("channel_route", route_id)
             github_channels = github_channel_ids(db, workspace_id)
             if body.enabled and any(
-                source.github_filter is None
-                and (source.channel_id in github_channels or source.kind in GITHUB_KINDS)
+                (source.channel_id in github_channels or source.kind in GITHUB_KINDS)
                 and (source.repository is None or not body.allowed_users.get(source.channel_id))
                 for source in body.sources
             ):
                 raise ServiceError(
                     "invalid_argument",
                     "Set the GitHub repositories in Sources and allowed users in Filters.",
-                    {"field": "github_filter"},
+                    {"field": "repository"},
                 )
             if any(
                 not re.fullmatch(LOGIN_PATTERN, user)
@@ -398,11 +397,11 @@ class Accounts:
 
     async def github_repositories(self, account: sqlite3.Row) -> set[str]:
         return {
-            repository
+            source.repository.lower()
             for route in await self.routes(account["workspace_id"])
-            if route.enabled and route.principal_id
+            if route.enabled and route.principal_id and route.allowed_users.get(account["id"])
             for source in route.sources
-            for repository in route.github_repositories(source, account["id"])
+            if source.channel_id == account["id"] and source.repository
         }
 
     async def receive_github(self, account: sqlite3.Row, message: ChannelMessage | None, cursor: str | None) -> None:

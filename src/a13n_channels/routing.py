@@ -9,7 +9,7 @@ from typing import Annotated, Literal
 from a13n_service.infra.errors import ServiceError
 from pydantic import BaseModel, Field, StringConstraints, model_validator
 
-from a13n_channels.channels.github import GITHUB_KINDS, Login, RepositoryName
+from a13n_channels.channels.github import GITHUB_KINDS, RepositoryName
 from a13n_channels.messages import ChannelMessage
 
 type Choice = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=512)]
@@ -67,32 +67,17 @@ SCHEMA = """
 MULTIPARTY_KINDS = {"group", "guild", "channel", "thread", "issue", "pull_request"}
 
 
-class GitHubFilter(BaseModel):
-    repositories: list[RepositoryName] = Field(min_length=1, max_length=30)
-    users: list[Login] = Field(min_length=1, max_length=30)
-
-    @model_validator(mode="after")
-    def normalize(self) -> "GitHubFilter":
-        self.repositories = list(dict.fromkeys(name.lower() for name in self.repositories))
-        self.users = list(dict.fromkeys(name.lower() for name in self.users))
-        return self
-
-
 class Source(BaseModel, frozen=True):
     channel_id: Choice
     kind: Kind
     conversation_id: Choice
     mentions_only: bool = False
     repository: RepositoryName | None = None
-    github_filter: GitHubFilter | None = None
 
     @model_validator(mode="after")
     def validate_wildcard(self) -> "Source":
         if self.repository and (
-            self.channel_id == "*"
-            or self.kind not in {"*", *GITHUB_KINDS}
-            or self.conversation_id != "*"
-            or self.github_filter is not None
+            self.channel_id == "*" or self.kind not in {"*", *GITHUB_KINDS} or self.conversation_id != "*"
         ):
             raise ValueError("A repository requires a GitHub account and repository-level conversation matching.")
         if self.kind == "*" and self.conversation_id != "*":
@@ -134,29 +119,10 @@ class RouteInput(BaseModel):
         default_factory=dict, max_length=100
     )
 
-    def github_repositories(self, source: Source, channel_id: str) -> list[str]:
-        if source.channel_id not in {"*", channel_id} or source.kind not in {"*", *GITHUB_KINDS}:
-            return []
-        if source.github_filter:
-            return source.github_filter.repositories
-        return [source.repository.lower()] if source.repository and self.allowed_users.get(channel_id) else []
-
-    def github_users(self, source: Source, channel_id: str) -> set[str]:
-        users = {user.lower() for user in self.allowed_users.get(channel_id, [])}
-        if source.github_filter:
-            legacy = set(source.github_filter.users)
-            return legacy & users if users else legacy
-        return users if source.repository else set()
-
-    def matches_sender(
-        self, source: Source, channel_id: str, kind: str, conversation_id: str, sender_id: str | None
-    ) -> bool:
+    def matches_sender(self, source: Source, channel_id: str, kind: str, sender_id: str | None) -> bool:
         users = self.allowed_users.get(channel_id)
         if kind in GITHUB_KINDS:
-            return (sender_id or "").lower() in self.github_users(source, channel_id) and (
-                source.github_filter is None
-                or conversation_id.rpartition("#")[0].lower() in source.github_filter.repositories
-            )
+            return bool(source.repository and users and (sender_id or "").lower() in {user.lower() for user in users})
         return users is None or sender_id in users
 
     @model_validator(mode="after")
@@ -179,16 +145,9 @@ def github_channel_ids(db: sqlite3.Connection, workspace_id: str) -> set[str]:
 
 
 def read_routes(db: sqlite3.Connection, workspace_id: str) -> list[Route]:
-    channels = github_channel_ids(db, workspace_id)
     routes = []
     for row in db.execute("SELECT * FROM channel_routes WHERE workspace_id = ? ORDER BY name, id", (workspace_id,)):
         config = json.loads(row["sources"])
-        if legacy := config.pop("github_filter", None):
-            for source in config["sources"]:
-                if source["kind"] in GITHUB_KINDS or (
-                    source["kind"] == "*" and source["channel_id"] in channels | {"*"}
-                ):
-                    source.setdefault("github_filter", legacy)
         routes.append(
             Route(
                 id=row["id"],
@@ -217,7 +176,7 @@ def select_route(
         for route in routes
         for source in route.sources
         if source.matches(channel_id, kind, conversation_id)
-        and route.matches_sender(source, channel_id, kind, conversation_id, sender_id)
+        and route.matches_sender(source, channel_id, kind, sender_id)
     )
     match = max(candidates, key=lambda candidate: candidate[0].specificity, default=None)
     if match is None:
@@ -233,15 +192,12 @@ def validate_route(route: RouteInput, routes: list[Route], route_id: str, github
     def overlaps(left: Source, right: Source, other: RouteInput) -> bool:
         if left.address != right.address:
             return False
-        first, second = left.github_filter, right.github_filter
         channel = left.channel_id
-        if channel in github_channels or left.kind in GITHUB_KINDS:
-            if first and second and not set(first.repositories).intersection(second.repositories):
-                return False
-            if first is None and second is None and left.repository is None:
-                return True
-            return bool(route.github_users(left, channel) & other.github_users(right, channel))
         left_users, right_users = route.allowed_users.get(channel), other.allowed_users.get(channel)
+        if channel in github_channels or left.kind in GITHUB_KINDS:
+            return left.repository is None or bool(
+                {user.lower() for user in left_users or []} & {user.lower() for user in right_users or []}
+            )
         return left_users is None or right_users is None or bool(set(left_users).intersection(right_users))
 
     if any(overlaps(left, right, route) for left, right in combinations(route.sources, 2)):

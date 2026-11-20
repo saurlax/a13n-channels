@@ -1,5 +1,5 @@
 import {
-  React, ApiError, Button, ChoiceField, Empty, ErrorPage, Input, Link, Loading, Page, Switch,
+  React, ApiError, Badge, Button, ChoiceField, Empty, ErrorPage, Input, Link, Loading, Page, Switch,
   useAccess, useApp, useNavigate, useQuery, useQueryClient, useTranslation,
 } from "@a13n/console";
 import { ChannelIcon, type Platform } from "./channel-icon";
@@ -18,7 +18,6 @@ const english = {
   all: "All", repository: "Repository", allowedUsers: "Allowed users", user: "User",
   addUser: "Add users", removeUser: "Remove allowed users", usersPlaceholder: "Separate user IDs with commas",
   invalidUsers: "Choose a channel account and enter valid users for each row.",
-  replaceSource: "Replace legacy source", legacySource: "Existing rule",
   githubError: "Enter GitHub repositories and allowed users.",
   filters: "Filters", multiparty: "Group and channel messages",
   mentionsOnly: "Only @bot", allMessages: "All messages", originalFilters: "Keep current source filters",
@@ -59,7 +58,6 @@ const chinese: typeof english = {
   all: "全部", repository: "仓库", allowedUsers: "允许的用户", user: "用户",
   addUser: "添加用户", removeUser: "移除允许的用户", usersPlaceholder: "多个用户 ID 用逗号分隔",
   invalidUsers: "请为每行选择渠道账号并填写有效的用户。",
-  replaceSource: "替换旧来源", legacySource: "已有规则",
   githubError: "请填写 GitHub 仓库和允许触发的用户。",
   filters: "筛选器", multiparty: "多人聊天消息",
   mentionsOnly: "仅 @ 机器人", allMessages: "全量消息", originalFilters: "保留已有来源筛选",
@@ -89,11 +87,10 @@ const chinese: typeof english = {
 
 type Account = { id: string; name: string; platform: Platform; conversation_kinds: string[] };
 type Agent = { id: string; name: string };
-type Source = { channel_id: string; kind: string; conversation_id: string; mentions_only?: boolean; repository?: string | null; github_filter?: GitHubFilter | null };
+type Source = { channel_id: string; kind: string; conversation_id: string; mentions_only?: boolean; repository?: string | null };
 type MultipartyFilter = "all" | "mentions";
 type ThreadPolicy = keyof typeof english.policies;
 const threadPolicies: ThreadPolicy[] = ["conversation", "sender", "fixed", "message"];
-type GitHubFilter = { repositories: string[]; users: string[] };
 type RouteInput = {
   name: string; agent_id: string; enabled: boolean; sources: Source[];
   thread_policy: ThreadPolicy; fixed_thread_id: string | null;
@@ -105,7 +102,7 @@ type RouteList = { configured: boolean; routes: Route[] };
 type Text = typeof english;
 
 type SourceDraft = Pick<Source, "channel_id" | "kind" | "mentions_only"> & {
-  conversations: string[]; input: string; legacy?: Source;
+  conversations: string[]; input: string;
 };
 type UserDraft = { id: number; channelId: string; users: string };
 
@@ -123,13 +120,8 @@ function draftSources(sources: Source[]): SourceDraft[] {
   const rows: SourceDraft[] = [];
   const groups = new Map<string, SourceDraft>();
   for (const source of sources) {
-    const { channel_id, kind, mentions_only, conversation_id, repository, github_filter } = source;
+    const { channel_id, kind, mentions_only, conversation_id, repository } = source;
     const draft = { ...sourceDefaults(), channel_id, kind, mentions_only };
-    if (github_filter || (channel_id === "*" && kind !== "*") ||
-        ((kind === "issue" || kind === "pull_request") && conversation_id !== "*")) {
-      rows.push({ ...draft, legacy: source });
-      continue;
-    }
     const conversation = repository ?? conversation_id;
     const key = JSON.stringify([channel_id, kind, Boolean(mentions_only), Boolean(repository)]);
     const existing = conversation === "*" ? undefined : groups.get(key);
@@ -170,6 +162,15 @@ async function responseJSON<T>(response: Response): Promise<T> {
   return response.json();
 }
 
+function TrashIcon() {
+  return (
+    <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none"
+      stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7" />
+    </svg>
+  );
+}
+
 function SourceEditor({ source, accounts, update, remove, text, disabled }: {
   source: SourceDraft; accounts: Account[]; update: (value: SourceDraft) => void;
   remove?: () => void; text: Text; disabled: boolean;
@@ -179,7 +180,7 @@ function SourceEditor({ source, accounts, update, remove, text, disabled }: {
   const account = accounts.find(item => item.id === source.channel_id);
   const github = isGitHub(account);
   const supported = ["*", ...(account?.conversation_kinds ?? [])];
-  const kind = account && !source.legacy ? source.kind : "*";
+  const kind = account ? source.kind : "*";
   const conversationLabel = github ? text.repository : text.conversationId;
   function addConversation() {
     const value = source.input.trim();
@@ -188,7 +189,7 @@ function SourceEditor({ source, accounts, update, remove, text, disabled }: {
   }
   const observed = useQuery({
     queryKey: app.queryKey("route-sources", source.channel_id, source.kind),
-    enabled: Boolean(account && !github && !disabled && !source.legacy && kind !== "*"),
+    enabled: Boolean(account && !github && !disabled && kind !== "*"),
     queryFn: async ({ signal }) => responseJSON<{ id: string }[]>(await app.request(
       "/route-sources?" + new URLSearchParams({ channel_id: source.channel_id, kind: source.kind }),
       { signal },
@@ -208,27 +209,14 @@ function SourceEditor({ source, accounts, update, remove, text, disabled }: {
           onChange={id => update({ ...sourceDefaults(), channel_id: id })} />
       </td>
       <td>
-        <ChannelSelect label={text.kind} disabled={disabled || !account || Boolean(source.legacy)} value={kind}
+        <ChannelSelect label={text.kind} disabled={disabled || !account} value={kind}
           options={(supported.includes(kind) ? supported : [kind, ...supported])
-            .map(value => ({ value, label: value === "*" && account && !source.legacy ? text.all : kindName(value, text) }))}
+            .map(value => ({ value, label: value === "*" && account ? text.all : kindName(value, text) }))}
           onChange={kind => update({ ...source, kind, mentions_only: false,
             conversations: github ? source.conversations : [], input: github ? source.input : "" })} />
       </td>
       <td>
-        {source.legacy ? (
-          <>
-            <p className="a13n-route-thread-help">{text.legacySource} · {[
-              kindName(source.kind, text),
-              source.legacy.conversation_id !== "*" ? source.legacy.conversation_id : null,
-              ...source.legacy.github_filter?.repositories ?? [],
-              ...source.legacy.github_filter?.users ?? [],
-            ].filter(Boolean).join(" · ")}</p>
-            {!disabled && <Button type="button" size="sm" variant="outline"
-              onClick={() => update({ ...sourceDefaults(), channel_id: account?.id ?? "" })}>
-              {text.replaceSource}
-            </Button>}
-          </>
-        ) : !account || (!github && kind === "*") ? (
+        {!account || (!github && kind === "*") ? (
           <span className="a13n-route-all-conversations">{text.anyConversation}</span>
         ) : (
           <div className="a13n-route-conversations">
@@ -262,7 +250,7 @@ function SourceEditor({ source, accounts, update, remove, text, disabled }: {
       </td>
       {remove !== undefined && <td className="a13n-route-source-action">
         <Button type="button" size="icon-sm" variant="ghost" disabled={disabled} aria-label={text.removeSource}
-          title={text.removeSource} onClick={remove}>×</Button>
+          title={text.removeSource} onClick={remove}><TrashIcon /></Button>
       </td>}
     </tr>
   );
@@ -363,10 +351,6 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
     }
     const savedSources: Source[] = [];
     for (const { value } of sources) {
-      if (value.legacy) {
-        savedSources.push({ ...value.legacy, mentions_only: multiparty === "legacy" && value.mentions_only });
-        continue;
-      }
       const github = isGitHub(accounts.find(item => item.id === value.channel_id));
       const ids = conversationIds(value, github);
       if (github && (ids.some(id => !validRepo(id)) || (enabled && (!ids.length || !usersByAccount.has(value.channel_id))))) {
@@ -402,7 +386,7 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
     } catch (error) {
       if (error instanceof ApiError && error.details.reason === "thread_destination_busy") {
         setError(text.busyThread);
-      } else if (error instanceof ApiError && error.details.field === "github_filter") {
+      } else if (error instanceof ApiError && error.details.field === "repository") {
         setError(text.githubError);
       } else if (error instanceof ApiError && error.details.field === "allowed_users") {
         setError(text.invalidUsers);
@@ -526,7 +510,10 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
                     }} /></td>
                   {canEdit && <td className="a13n-route-source-action">
                     <Button type="button" size="icon-sm" variant="ghost" disabled={disabled} aria-label={text.removeUser}
-                      onClick={() => setAllowedUsers(current => current.filter(item => item.id !== row.id))}>×</Button>
+                      title={text.removeUser}
+                      onClick={() => setAllowedUsers(current => current.filter(item => item.id !== row.id))}>
+                      <TrashIcon />
+                    </Button>
                   </td>}
                 </tr>
               ))}</tbody>
@@ -604,12 +591,7 @@ export function RoutePage({ nav, base, routeKey }: { nav: React.ReactNode; base:
       </Page>
     );
   }
-  const sourceName = (source: Source) => {
-    const channel = source.channel_id === "*" ? text.anyChannel :
-      accounts.data?.accounts.find(item => item.id === source.channel_id)?.name ?? source.channel_id;
-    return [channel, kindName(source.kind, text), source.repository ?? (source.conversation_id === "*" ? null : source.conversation_id)]
-      .filter(Boolean).join(" · ");
-  };
+  const accountsById = new Map(accounts.data?.accounts.map(account => [account.id, account]));
   return (
     <Page title={text.title} actions={routeList.length > 0 ? add : undefined}>
       {nav}
@@ -625,15 +607,28 @@ export function RoutePage({ nav, base, routeKey }: { nav: React.ReactNode; base:
                 <tbody>
                   {routeList.map(route => {
                     const href = `${base}/routes/${encodeURIComponent(route.id)}`;
-                    const sources = route.sources.map(sourceName);
+                    const channelIds = [...new Set(route.sources.map(source => source.channel_id))];
+                    const allChannels = channelIds.includes("*");
+                    const channels = channelIds.map(id => ({
+                      name: accountsById.get(id)?.name ?? id,
+                      platform: accountsById.get(id)?.platform,
+                    }));
+                    const first = channels[0];
+                    const channelNames = allChannels ? text.anyChannel : channels.map(channel => channel.name).join(", ");
                     return (
                       <tr key={route.id} data-editable onClick={() => navigate(href)}>
                         <th scope="row" className="a13n-channel-identity">
                           <Link to={href} onClick={event => event.stopPropagation()}><strong>{route.name}</strong></Link>
                         </th>
-                        <td data-label={text.sources} className="a13n-route-cell" title={sources.join("\n")}>
-                          {sources[0]}
-                          {sources.length > 1 && <span className="a13n-route-source-count">+{sources.length - 1}</span>}
+                        <td data-label={text.sources} title={channelNames}>
+                          <div className="a13n-route-source-summary">
+                            <Badge variant="secondary" className="a13n-route-source-badge">
+                              {!allChannels && first.platform && <ChannelIcon platform={first.platform} />}
+                              <span>{allChannels ? text.all : first.name}</span>
+                            </Badge>
+                            {!allChannels && channels.length > 1 &&
+                              <span className="a13n-route-source-count">+{channels.length - 1}</span>}
+                          </div>
                         </td>
                         <td data-label={text.agent}>{agents.data?.find(item => item.id === route.agent_id)?.name ?? route.agent_id}</td>
                         <td data-label={text.status}>
