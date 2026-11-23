@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable
@@ -21,7 +22,7 @@ from a13n_service.resources.models.service import resolve_model
 from a13n_service.resources.uploads import service as uploads
 from a13n_service.runs import entries, runs, submit
 from a13n_service.runs.runtime import Runtime
-from a13n_service.runs.schemas import Message, NewThread
+from a13n_service.runs.schemas import Failure, Message, NewThread
 from a13n_service.runs.tables import RunRow
 from a13n_service.tenancy.access import principal_for
 from a13n_service.tenancy.authorize import Principal, WorkspaceScope, allowed_verbs, authorize
@@ -40,10 +41,32 @@ INLINE_IMAGE_BYTES = 10 << 20
 INLINE_IMAGE_TIMEOUT = 10
 
 
+def failure_notice(status: str, failure: Failure | None) -> str:
+    if status == "cancelled":
+        return "Agent request was cancelled."
+    if failure:
+        match = re.search(r"\bHTTP ([1-5][0-9]{2})\b", failure.message)
+        http_status = int(match[1]) if match else None
+        if http_status == 429:
+            return "Agent request failed: service rate limit or quota exhausted (HTTP 429). Please try again later."
+        if http_status in {401, 403}:
+            return "Agent request failed: service authorization failed. Please contact the administrator."
+        if http_status and http_status >= 500:
+            return "Agent request failed: upstream service is unavailable. Please try again later."
+        if failure.code == "configuration_unavailable":
+            return "Agent request failed: Agent configuration is unavailable. Please contact the administrator."
+        if failure.code == "model_recovery_exhausted":
+            return "Agent request failed: model execution could not recover. Please try again later."
+    return "Agent request failed. Please try again later or contact the administrator."
+
+
 class Deliveries:
-    def __init__(self, store: Accounts, runtime: Runtime):
+    def __init__(
+        self, store: Accounts, runtime: Runtime, send_reply: Callable[[sqlite3.Row, str, str], Awaitable[str]]
+    ):
         self.store = store
         self.runtime = runtime
+        self.send_reply = send_reply
 
     async def actor(self, principal_id: str, account: sqlite3.Row) -> Principal:
         scope = WorkspaceScope(account["organization_id"], account["workspace_id"])
@@ -158,7 +181,7 @@ class Deliveries:
                 case "wake_queued":
                     await self.submit_wake(job, actor, route, message)
                 case "wake_submitted" | "submitted":
-                    await self.collect(job, actor)
+                    await self.collect(job, actor, account)
                 case "queued":
                     await self.submit(job, account, actor, route, message, qq_context=payload.get("qq_context"))
         except ServiceError as error:
@@ -433,7 +456,40 @@ class Deliveries:
             if saved and scope is not None:
                 db.execute("INSERT OR IGNORE INTO channel_threads VALUES (?, ?, ?, ?, ?, ?)", (*scope, thread_id))
 
-    async def collect(self, job: sqlite3.Row, actor: Principal) -> None:
+    def claim_failure_notice(self, delivery_id: str, status: str, text: str) -> bool:
+        with self.store.transaction() as db:
+            claimed = db.execute(
+                "UPDATE channel_deliveries SET status = 'failed', error = ? WHERE id = ? AND status = 'submitted'",
+                (f"run:{status}", delivery_id),
+            ).rowcount
+            if claimed:
+                db.execute(
+                    """INSERT INTO channel_sends (delivery_id, call_id, text, status)
+                       VALUES (?, 'run-failure', ?, 'sending')""",
+                    (delivery_id, text),
+                )
+            return bool(claimed)
+
+    async def notify_failure(
+        self, job: sqlite3.Row, account: sqlite3.Row, status: str, failure: Failure | None
+    ) -> None:
+        text = failure_notice(status, failure)
+        if not await asyncio.to_thread(self.claim_failure_notice, job["id"], status, text):
+            return
+        message_id = None
+        try:
+            message_id = await self.send_reply(account, job["message_id"], text)
+            outcome = "sent"
+        except ServiceError as error:
+            outcome = "unknown" if error.code == "unavailable" else "failed"
+        await self.store.query(
+            "UPDATE channel_sends SET status = ?, message_id = ? WHERE delivery_id = ? AND call_id = 'run-failure'",
+            outcome,
+            message_id,
+            job["id"],
+        )
+
+    async def collect(self, job: sqlite3.Row, actor: Principal, account: sqlite3.Row) -> None:
         wake = job["status"] == "wake_submitted"
         run_id = job["run_id"]
         if run_id is None:
@@ -469,6 +525,17 @@ class Deliveries:
         if status in {"accepted", "running"}:
             await self.later(job, 2)
             return
+        if not wake and status in {"failed", "cancelled"}:
+            origin = result
+            while origin.trigger == "resume" and origin.parent_run_id:
+                origin = await runs.get(self.runtime.storage, actor, job["workspace_id"], origin.parent_run_id)
+            if (
+                origin.source_entry_id == job["entry_id"]
+                and origin.agent_id == job["agent_id"]
+                and origin.principal_id == actor.id
+            ):
+                await self.notify_failure(job, account, status, result.failure)
+                return
         if status != "completed":
             await self.finish(job, "failed", f"{'wake' if wake else 'run'}:{status}")
             return

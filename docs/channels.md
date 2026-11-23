@@ -103,6 +103,8 @@ Channel delivery adds these Harness tools to the target Agent for that run:
 
 When a Run receives multiple channel messages, use the intended message ID to select the conversation for reads. The reply tool selects the triggering message even when later inputs steer the same Run. Assistant text stays in Console. The tools resolve the conversation from the Run's delivery record and require a currently enabled route and account. Failed deliveries and unconfirmed sends appear in route status. A replay of the same send call never resends an unconfirmed reply.
 
+If the target Run fails or is cancelled, Channels sends a short notice in the conversation of the message that started it. This also applies after a Run resumes. The notice uses fixed text for known failure categories and a generic message for other errors. The delivery stays failed. Channels records the send before contacting the platform and skips that attempt during recovery if confirmation is missing.
+
 ### Read across channels
 
 In the Agent editor, open **Advanced → Plugins → Add plugin**, choose **Channels**, and publish the Agent configuration. Set **Allowed channels** to a comma-separated list of channel account IDs, or leave it blank to allow all channel accounts in the current workspace for the active tools. Use the Channels App's account IDs. The **Channels Delivery** plugin is loaded automatically by routes.

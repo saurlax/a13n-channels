@@ -121,7 +121,7 @@ class ChannelsRuntime:
         self.qq_probes: set[str] = set()
         settings = runtime.settings.extensions.get(SETTINGS, ChannelsSettings())
         self.qq_connector = settings.qq_connector_path
-        self.deliveries = Deliveries(store, runtime)
+        self.deliveries = Deliveries(store, runtime, self.send_reply)
 
     def view(self, row: sqlite3.Row) -> QQAccount:
         return QQAccount(

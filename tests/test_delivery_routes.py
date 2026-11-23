@@ -3,6 +3,7 @@ import base64
 import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -301,7 +302,7 @@ def test_matched_text_retries_same_submission_and_reuses_source_thread(
         monkeypatch.setattr(delivery.entries, "get_entry", read_entry)
         monkeypatch.setattr(delivery.runs, "get", read_run)
 
-        deliveries = Deliveries(store, runtime)
+        deliveries = Deliveries(store, runtime, AsyncMock())
         await deliveries.process({"channel": account})
         assert attempts == []
         assert any(
@@ -392,14 +393,14 @@ def test_thread_destination_controls_reuse_and_queue_order(
         async def actor(_self, _principal, _account):
             return object()
 
-        async def collect(_self, _job, _actor):
+        async def collect(_self, _job, _actor, _account):
             pass
 
         monkeypatch.setattr(delivery.submit, "create_thread", create)
         monkeypatch.setattr(delivery.submit, "submit_message", append)
         monkeypatch.setattr(Deliveries, "actor", actor)
         monkeypatch.setattr(Deliveries, "collect", collect)
-        deliveries = Deliveries(store, SimpleNamespace(storage=None))
+        deliveries = Deliveries(store, SimpleNamespace(storage=None), AsyncMock())
         await deliveries.process({"channel": account})
         assert len(submissions) == first_batch
         for _ in range(3):
@@ -439,7 +440,7 @@ def test_mention_filter_preserves_source_priority_and_rechecks_queued_messages(t
         ]
         account = (await store.query("SELECT *, 'qq' AS platform FROM qq_accounts"))[0]
         routes = await store.routes("workspace")
-        await Deliveries(store, None).advance(jobs[0], account, routes)
+        await Deliveries(store, None, AsyncMock()).advance(jobs[0], account, routes)
         assert (await store.query("SELECT status FROM channel_deliveries WHERE message_id = 'before-change'"))[0][
             "status"
         ] == "stopped"
@@ -499,7 +500,7 @@ def test_wake_filter_runs_before_the_main_agent(output, expected, tmp_path, monk
         monkeypatch.setattr(delivery.submit, "create_thread", create)
         monkeypatch.setattr(delivery.entries, "get_entry", entry)
         monkeypatch.setattr(delivery.runs, "get", run)
-        deliveries = Deliveries(store, SimpleNamespace(storage=None))
+        deliveries = Deliveries(store, SimpleNamespace(storage=None), AsyncMock())
         routes = await store.routes("workspace")
         await deliveries.advance((await jobs())[0], account, routes)
         assert submitted[0][0].agent_id == route.wake_agent_id
@@ -875,3 +876,90 @@ def test_obsolete_github_route_cannot_deliver_or_be_enabled(tmp_path):
             await store.save_route("workspace", "legacy", body, principal_id="owner", create=False)
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("status", "resumed", "send_error", "outcome"),
+    [
+        ("failed", False, None, "sent"),
+        ("failed", True, "unavailable", "unknown"),
+        ("cancelled", True, "invalid_argument", "failed"),
+    ],
+)
+def test_terminal_run_notifies_only_its_trigger_once(tmp_path, monkeypatch, status, resumed, send_error, outcome):
+    async def exercise():
+        store = store_for(tmp_path)
+        await store.initialize()
+        await store.query(
+            "INSERT INTO qq_accounts VALUES ('channel', 'org', 'workspace', 'Bot', 'bot', 'credentials', 1)"
+        )
+        account = (await store.query("SELECT *, 'qq' AS platform FROM qq_accounts"))[0]
+        await store.save_route(
+            "workspace", "route", rule("Default", "agent", ("*", "*", "*")), principal_id="owner", create=True
+        )
+        for name in ("trigger", "steering", "wake"):
+            await store.receive(incoming(name, conversation=name), "credentials")
+        await store.query(
+            """UPDATE channel_deliveries SET entry_id = message_id, run_id = ?,
+               status = CASE WHEN message_id = 'wake' THEN 'wake_submitted' ELSE 'submitted' END""",
+            "successor" if resumed else "original",
+        )
+        origin = SimpleNamespace(
+            trigger="message",
+            source_entry_id="trigger",
+            agent_id="agent",
+            principal_id="owner",
+            failure=SimpleNamespace(code="model_recovery_exhausted", message="private-token HTTP 429"),
+            status=status,
+            output="private partial answer",
+        )
+
+        async def get_run(_storage, _actor, _workspace, run_id):
+            if run_id == "successor":
+                return SimpleNamespace(
+                    trigger="resume", parent_run_id="original", status=status, failure=origin.failure
+                )
+            assert run_id == "original"
+            return origin
+
+        send = AsyncMock(
+            return_value="receipt", side_effect=ServiceError(send_error, "private") if send_error else None
+        )
+        monkeypatch.setattr(Deliveries, "actor", AsyncMock(return_value=SimpleNamespace(id="owner")))
+        monkeypatch.setattr(delivery.runs, "get", get_run)
+        runtime = SimpleNamespace(storage=None)
+        worker = Deliveries(store, runtime, send)
+        accounts = {"channel": account}
+        await asyncio.gather(worker.process(accounts), worker.process(accounts))
+        await Deliveries(store_for(tmp_path), runtime, send).process(accounts)
+        text = (
+            "Agent request was cancelled."
+            if status == "cancelled"
+            else "Agent request failed: service rate limit or quota exhausted (HTTP 429). Please try again later."
+        )
+        send.assert_awaited_once_with(account, "trigger", text)
+        assert [tuple(row) for row in await store.query("SELECT status, text, message_id FROM channel_sends")] == [
+            (outcome, text, None if send_error else "receipt")
+        ]
+        assert [
+            tuple(row) for row in await store.query("SELECT status, error FROM channel_deliveries ORDER BY message_id")
+        ] == [("failed", f"run:{status}"), ("failed", f"run:{status}"), ("failed", f"wake:{status}")]
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("code", "detail", "expected"),
+    [
+        ("unknown", "HTTP 403", "authorization failed"),
+        ("unknown", "HTTP 503", "upstream service is unavailable"),
+        ("configuration_unavailable", "", "configuration is unavailable"),
+        ("model_recovery_exhausted", "", "model execution could not recover"),
+        ("private-code", "", "Agent request failed."),
+    ],
+)
+def test_failure_notice_only_publishes_fixed_diagnostics(code, detail, expected):
+    failure = delivery.Failure(code=code, message=f"private prompt and token {detail}")
+    notice = delivery.failure_notice("failed", failure)
+    assert expected in notice
+    assert "private" not in notice
