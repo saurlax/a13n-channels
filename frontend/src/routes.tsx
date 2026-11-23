@@ -408,7 +408,7 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
   }
 
   return (
-    <Page title={route?.name ?? text.add} back={back} backLabel={text.routes}>
+    <Page className="a13n-route-page" title={route?.name ?? text.add} back={back} backLabel={text.routes}>
       <form className="a13n-route-form" onSubmit={submit}>
         <div className="a13n-route-settings">
           <FormField label={text.name} data-field-layout="stacked" className="a13n-route-text-field">

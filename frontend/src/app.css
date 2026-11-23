@@ -348,15 +348,17 @@
   white-space: nowrap;
 }
 
+div.a13n-route-page {
+  max-width: none;
+}
+
 .a13n-route-form {
   display: grid;
-  width: min(100%, 960px);
   gap: 24px;
 }
 
 .a13n-route-settings {
   display: grid;
-  max-width: 680px;
   min-width: 0;
   gap: 16px;
 }
