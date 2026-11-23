@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -271,7 +272,7 @@ def test_matched_text_retries_same_submission_and_reuses_source_thread(
                     invocation,
                     SimpleNamespace(
                         thread=SimpleNamespace(id="thread-" + metadata["conversation_id"]),
-                        entry=SimpleNamespace(id=identifier),
+                        entry=SimpleNamespace(id=identifier, created_at=datetime.now(UTC)),
                     ),
                 )
                 if identifier == "first":
@@ -382,7 +383,8 @@ def test_thread_destination_controls_reuse_and_queue_order(
             name = channel_input(message)[0]["message_id"]
             target = thread_id or f"new-{name}"
             submissions[name] = target
-            return SimpleNamespace(thread=SimpleNamespace(id=target), entry=SimpleNamespace(id=name)), True
+            entry = SimpleNamespace(id=name, created_at=datetime.now(UTC))
+            return SimpleNamespace(thread=SimpleNamespace(id=target), entry=entry), True
 
         async def create(_runtime, _actor, _workspace, message, *, request_key):
             return accept(message)
@@ -406,6 +408,70 @@ def test_thread_destination_controls_reuse_and_queue_order(
         for _ in range(3):
             await deliveries.process({"channel": account})
         assert submissions == expected
+
+    asyncio.run(exercise())
+
+
+def test_managed_thread_rolls_over_after_idle_and_freezes_retry(tmp_path, monkeypatch, published_agent):
+    async def exercise():
+        store = store_for(tmp_path)
+        await store.initialize()
+        await store.query(
+            "INSERT INTO qq_accounts VALUES ('channel', 'org', 'workspace', 'Bot', 'bot', 'credentials', 1)"
+        )
+        account = (await store.query("SELECT *, 'qq' AS platform FROM qq_accounts"))[0]
+        route = rule("Route", "ag_012345678901234567890123456789ab", ("channel", "*", "*"))
+        assert route.context_idle_seconds == 3600
+        route = route.model_copy(update={"context_idle_seconds": 10})
+        await store.save_route("workspace", "route", route, principal_id="owner", create=True)
+        assert (await store.routes("workspace"))[0].context_idle_seconds == 10
+
+        clock = SimpleNamespace(now=100)
+        monkeypatch.setattr(delivery, "time", SimpleNamespace(time=lambda: clock.now))
+        submissions = []
+
+        async def create(_runtime, _actor, _workspace, message, *, request_key):
+            name = channel_input(message)[0]["message_id"]
+            submissions.append((name, None, request_key))
+            if name == "expired" and len(submissions) == 4:
+                raise ServiceError("unavailable", "Retry this submission.")
+            entry = SimpleNamespace(id=name, created_at=datetime.fromtimestamp(clock.now, UTC))
+            return SimpleNamespace(thread=SimpleNamespace(id=f"new-{name}"), entry=entry), True
+
+        async def append(_runtime, _actor, _workspace, thread_id, message, *, request_key):
+            name = channel_input(message)[0]["message_id"]
+            submissions.append((name, thread_id, request_key))
+            entry = SimpleNamespace(id=name, created_at=datetime.fromtimestamp(clock.now, UTC))
+            return SimpleNamespace(thread=SimpleNamespace(id=thread_id), entry=entry), True
+
+        monkeypatch.setattr(delivery.submit, "create_thread", create)
+        monkeypatch.setattr(delivery.submit, "submit_message", append)
+        monkeypatch.setattr(Deliveries, "actor", AsyncMock(return_value=object()))
+        monkeypatch.setattr(Deliveries, "collect", AsyncMock())
+        activity = AsyncMock(side_effect=[True, False])
+        monkeypatch.setattr(Deliveries, "has_context_activity", activity)
+        deliveries = Deliveries(store, SimpleNamespace(storage=None), AsyncMock())
+
+        for name, now in [("first", 100), ("recent", 109), ("active", 119), ("expired", 129)]:
+            clock.now = now
+            await store.receive(incoming(name), "credentials")
+            await deliveries.process({"channel": account})
+
+        assert [(name, target) for name, target, _key in submissions] == [
+            ("first", None),
+            ("recent", "new-first"),
+            ("active", "new-first"),
+            ("expired", None),
+        ]
+        assert [call.args[2].timestamp() for call in activity.await_args_list] == [109, 119]
+        assert (await store.query("SELECT thread_id FROM channel_threads"))[0]["thread_id"] == "new-first"
+
+        route = route.model_copy(update={"context_idle_seconds": 3600})
+        await store.save_route("workspace", "route", route, principal_id="owner", create=False)
+        clock.now = 159
+        await deliveries.process({"channel": account})
+        assert submissions[-1] == submissions[-2]
+        assert (await store.query("SELECT thread_id FROM channel_threads"))[0]["thread_id"] == "new-expired"
 
     asyncio.run(exercise())
 
@@ -488,7 +554,8 @@ def test_wake_filter_runs_before_the_main_agent(output, expected, tmp_path, monk
 
         async def create(_runtime, _actor, _workspace, body, *, request_key):
             submitted.append((body, request_key))
-            return SimpleNamespace(thread=SimpleNamespace(id="thr_new"), entry=SimpleNamespace(id="inb_new")), True
+            entry = SimpleNamespace(id="inb_new", created_at=datetime.now(UTC))
+            return SimpleNamespace(thread=SimpleNamespace(id="thr_new"), entry=entry), True
 
         async def entry(*_args):
             return SimpleNamespace(assigned_run_id="run_wake")

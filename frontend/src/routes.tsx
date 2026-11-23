@@ -30,6 +30,8 @@ const english = {
   deleteBody: "New messages will stop using this route. Existing Console conversations are retained.",
   unconfigured: "Channels storage is not configured.",
   threadPolicy: "Thread behavior", fixedThreadId: "Thread ID (optional)",
+  contextIdle: "Context retention (seconds)",
+  contextIdleHelp: "After this much idle time, the next message starts a new Session.",
   policies: { conversation: "Reuse by conversation", sender: "Reuse by sender", fixed: "Reuse one Thread", message: "New Thread for each message" },
   policyHelp: {
     conversation: "Each channel account and conversation has its own history.",
@@ -70,6 +72,8 @@ const chinese: typeof english = {
   deleteBody: "新消息将不再使用这条路由。已有的 Console 会话会保留。",
   unconfigured: "尚未配置渠道存储。",
   threadPolicy: "Thread 投递模式", fixedThreadId: "Thread ID（选填）",
+  contextIdle: "上下文保留时间（秒）",
+  contextIdleHelp: "空闲达到此时长后，下一条消息会开启新会话。",
   policies: { conversation: "按会话复用", sender: "按会话内发送者复用", fixed: "固定 Thread", message: "每条消息新建 Thread" },
   policyHelp: {
     conversation: "每个渠道账号下的每个会话都有独立的上下文。",
@@ -94,6 +98,7 @@ const threadPolicies: ThreadPolicy[] = ["conversation", "sender", "fixed", "mess
 type RouteInput = {
   name: string; agent_id: string; enabled: boolean; sources: Source[];
   thread_policy: ThreadPolicy; fixed_thread_id: string | null;
+  context_idle_seconds: number;
   multiparty_messages: MultipartyFilter | null; wake_agent_id: string | null;
   allowed_users: Record<string, string[]>;
 };
@@ -314,7 +319,9 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
   );
   const [policy, setPolicy] = React.useState<ThreadPolicy>(route?.thread_policy ?? "conversation");
   const [threadId, setThreadId] = React.useState(route?.fixed_thread_id ?? "");
+  const [contextIdle, setContextIdle] = React.useState(String(route?.context_idle_seconds ?? 3600));
   const threadHelpId = React.useId();
+  const contextIdleHelpId = React.useId();
   const enabledId = React.useId();
   const [enabled, setEnabled] = React.useState(route?.enabled ?? true);
   const [sources, setSources] = React.useState(
@@ -330,6 +337,7 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
   const [error, setError] = React.useState("");
   const disabled = pending || !canEdit;
   const canRemoveSource = canEdit && sources.length > 1;
+  const managesContext = policy !== "message" && !(policy === "fixed" && threadId.trim());
 
   function returnToList() {
     void client.invalidateQueries({ queryKey: app.queryKey("channel-routes") });
@@ -380,6 +388,7 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
           sources: savedSources, allowed_users: Object.fromEntries(usersByAccount),
           multiparty_messages: multiparty === "legacy" ? null : multiparty, wake_agent_id: wakeAgent || null,
           thread_policy: policy, fixed_thread_id: policy === "fixed" ? threadId.trim() || null : null,
+          context_idle_seconds: managesContext ? Number(contextIdle) : route?.context_idle_seconds ?? 3600,
         } satisfies RouteInput),
       });
       returnToList();
@@ -427,8 +436,12 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
             {policy === "fixed" && <label>{text.fixedThreadId}<Input disabled={disabled} maxLength={512}
               value={threadId} onChange={event => setThreadId(event.currentTarget.value)}
               aria-describedby={threadHelpId} /></label>}
+            {managesContext && <label>{text.contextIdle}<Input type="number" required disabled={disabled}
+              min={1} max={Number.MAX_SAFE_INTEGER} step={1} value={contextIdle}
+              onChange={event => setContextIdle(event.currentTarget.value)} aria-describedby={contextIdleHelpId} /></label>}
           </div>
           <p id={threadHelpId} className="a13n-route-thread-help">{text.policyHelp[policy]}</p>
+          {managesContext && <p id={contextIdleHelpId} className="a13n-route-thread-help">{text.contextIdleHelp}</p>}
         </section>
         <section className="a13n-route-sources" aria-label={text.sources}>
           <div className="a13n-route-section-header">

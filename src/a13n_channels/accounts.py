@@ -73,6 +73,8 @@ class Accounts:
                 db.execute("BEGIN IMMEDIATE")
                 if not any(row[1] == "principal_id" for row in db.execute("PRAGMA table_info(channel_routes)")):
                     db.execute("ALTER TABLE channel_routes ADD COLUMN principal_id TEXT")
+                if not any(row[1] == "last_submitted_at" for row in db.execute("PRAGMA table_info(channel_threads)")):
+                    db.execute("ALTER TABLE channel_threads ADD COLUMN last_submitted_at REAL NOT NULL DEFAULT 0")
                 if not any(row[1] == "destination" for row in db.execute("PRAGMA table_info(channel_deliveries)")):
                     db.execute("ALTER TABLE channel_deliveries ADD COLUMN destination TEXT NOT NULL DEFAULT ''")
                     db.execute("""UPDATE channel_deliveries SET destination =
@@ -232,6 +234,7 @@ class Accounts:
                         include={
                             "sources",
                             "thread_policy",
+                            "context_idle_seconds",
                             "fixed_thread_id",
                             "multiparty_messages",
                             "wake_agent_id",
