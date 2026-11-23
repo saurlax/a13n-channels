@@ -530,6 +530,10 @@ div.a13n-route-page {
   border-top: 1px solid var(--a13n-border);
 }
 
+.a13n-route-maintenance {
+  margin-inline-end: auto;
+}
+
 
 .dark .a13n-channel-icon:is([data-platform="github"], [data-platform="github_app"]) {
   filter: brightness(0) invert(1);

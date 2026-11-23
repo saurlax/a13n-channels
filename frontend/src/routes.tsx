@@ -1,6 +1,6 @@
 import {
   React, ApiError, Badge, Button, ChoiceField, Empty, ErrorPage, FormField, Input, Link, Loading, Page, Switch,
-  useAccess, useApp, useNavigate, useQuery, useQueryClient, useTranslation,
+  useAccess, useApp, useNavigate, useQuery, useQueryClient, useToast, useTranslation,
 } from "@a13n/console";
 import { ChannelIcon, type Platform } from "./channel-icon";
 import { ChannelSelect } from "./select";
@@ -10,6 +10,11 @@ const english = {
   kind: "Conversation type", conversation: "Conversation", conversationId: "Conversation ID", agent: "Target Agent",
   status: "Status", enable: "Enable route", enabled: "Enabled", paused: "Paused", attention: "Needs attention",
   add: "Add route", routes: "Delivery routes", empty: "No routes yet", missingRoute: "Route not found",
+  resetConversations: "Reset conversations",
+  confirmReset: "Confirm reset",
+  resetBody: "Clear this route’s Thread bindings and fixed Thread ID. The next matching message starts a new Thread. Active runs continue, and earlier conversations remain available.",
+  resetDone: "Conversations reset. New deliveries start with new Threads.",
+  resetError: "Could not reset conversations. Try again.",
   addSource: "Add source", removeSource: "Remove source", selectAgent: "Select a published Agent",
   anyChannel: "All channel accounts", anyConversation: "All conversations", conversationPlaceholder: "All conversations when empty", removeConversation: "Remove conversation",
   sourceLimit: "Use at most 100 source rules, counting each conversation ID.",
@@ -52,6 +57,11 @@ const chinese: typeof english = {
   kind: "会话类型", conversation: "会话", conversationId: "会话 ID", agent: "目标 Agent",
   status: "状态", enable: "启用路由", enabled: "已启用", paused: "已停用", attention: "投递异常",
   add: "添加路由", routes: "投递路由", empty: "暂无投递路由", missingRoute: "找不到路由",
+  resetConversations: "重置会话",
+  confirmReset: "确认重置",
+  resetBody: "这会清除当前路由的 Thread 绑定和固定 Thread ID。下一条符合条件的消息会开启新 Thread，运行中的任务会继续，历史会话仍可查看。",
+  resetDone: "会话已重置。后续投递将使用新 Thread。",
+  resetError: "未能重置会话，请重试。",
   addSource: "添加来源", removeSource: "移除来源", selectAgent: "选择已发布的 Agent",
   anyChannel: "全部渠道账号", anyConversation: "全部会话", conversationPlaceholder: "留空匹配全部会话", removeConversation: "移除会话",
   sourceLimit: "来源规则最多 100 条，每个会话 ID 各算一条。",
@@ -261,15 +271,25 @@ function SourceEditor({ source, accounts, update, remove, text, disabled }: {
   );
 }
 
-function RouteDelete({ route, text, dismiss, onDeleted }: {
-  route: Route; text: Text; dismiss: () => void; onDeleted: () => void;
+type RouteAction = "reset" | "delete";
+
+function RouteConfirmation({ route, action, text, dismiss, onConfirmed }: {
+  route: Route; action: RouteAction; text: Text; dismiss: () => void; onConfirmed: () => void;
 }) {
   const app = useApp();
   const dialog = React.useRef<HTMLDialogElement>(null);
   const titleId = React.useId();
+  const descriptionId = React.useId();
+  const resetting = action === "reset";
+  const title = resetting ? text.resetConversations : text.deleteTitle;
   const [pending, setPending] = React.useState(false);
   const [failed, setFailed] = React.useState(false);
   React.useEffect(() => { dialog.current?.showModal(); }, []);
+
+  function cancel() {
+    dialog.current?.close();
+    dismiss();
+  }
 
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -277,8 +297,10 @@ function RouteDelete({ route, text, dismiss, onDeleted }: {
     setPending(true);
     setFailed(false);
     try {
-      await app.request(`/routes/${encodeURIComponent(route.id)}`, { method: "DELETE" });
-      onDeleted();
+      const path = `/routes/${encodeURIComponent(route.id)}`;
+      await app.request(resetting ? `${path}/reset-conversations` : path, { method: resetting ? "POST" : "DELETE" });
+      dialog.current?.close();
+      onConfirmed();
     } catch {
       setFailed(true);
       setPending(false);
@@ -286,18 +308,18 @@ function RouteDelete({ route, text, dismiss, onDeleted }: {
   }
 
   return (
-    <dialog className="a13n-qq-dialog" ref={dialog} aria-labelledby={titleId}
-      onCancel={event => { event.preventDefault(); if (!pending) dismiss(); }}>
+    <dialog className="a13n-qq-dialog" ref={dialog} aria-labelledby={titleId} aria-describedby={descriptionId}
+      onCancel={event => { event.preventDefault(); if (!pending) cancel(); }}>
       <form onSubmit={submit}>
         <header className="a13n-channel-edit-header">
-          <h2 id={titleId}>{text.deleteTitle}</h2>
+          <h2 id={titleId}>{title}</h2>
           <p>{route.name}</p>
         </header>
-        <p>{text.deleteBody}</p>
-        {failed && <p role="alert">{text.deleteError}</p>}
+        <p id={descriptionId}>{resetting ? text.resetBody : text.deleteBody}</p>
+        {failed && <p role="alert">{resetting ? text.resetError : text.deleteError}</p>}
         <div className="a13n-qq-actions">
-          <Button type="button" variant="outline" disabled={pending} onClick={dismiss}>{text.cancel}</Button>
-          <Button type="submit" variant="destructive" disabled={pending}>{text.deleteTitle}</Button>
+          <Button type="button" variant="outline" disabled={pending} onClick={cancel}>{text.cancel}</Button>
+          <Button type="submit" variant="destructive" disabled={pending}>{resetting ? text.confirmReset : title}</Button>
         </div>
       </form>
     </dialog>
@@ -308,7 +330,9 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
   route?: Route; accounts: Account[]; agents: Agent[]; text: Text; back: string; canEdit: boolean;
 }) {
   const app = useApp();
+  const { can } = useAccess();
   const client = useQueryClient();
+  const toast = useToast();
   const navigate = useNavigate();
   const [name, setName] = React.useState(route?.name ?? "");
   const [agent, setAgent] = React.useState(route?.agent_id ?? "");
@@ -329,7 +353,7 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
   );
   const nextUser = React.useRef(allowedUsers.length);
   const nextSource = React.useRef(sources.length);
-  const [deleting, setDeleting] = React.useState(false);
+  const [confirming, setConfirming] = React.useState<RouteAction | null>(null);
   const [pending, setPending] = React.useState(false);
   const [error, setError] = React.useState("");
   const disabled = pending || !canEdit;
@@ -339,6 +363,17 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
   function returnToList() {
     void client.invalidateQueries({ queryKey: app.queryKey("channel-routes") });
     navigate(back);
+  }
+
+  function finishAction() {
+    setConfirming(null);
+    if (confirming === "delete") {
+      returnToList();
+    } else {
+      setThreadId("");
+      void client.invalidateQueries({ queryKey: app.queryKey("channel-routes") });
+      toast.add({ type: "success", title: text.resetDone });
+    }
   }
 
   async function submit(event: React.FormEvent<HTMLFormElement>) {
@@ -531,16 +566,21 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
         {canEdit && <>
           <p className="a13n-route-notice">{text.routeAuthority}</p>
           <div className="a13n-qq-actions a13n-route-form-actions">
-            {route && <Button type="button" className="a13n-channel-delete" variant="destructive-outline"
-              disabled={pending} onClick={() => setDeleting(true)}>{text.remove}</Button>}
-            <Button type="button" variant="outline" disabled={pending} onClick={() => navigate(back)}>{text.cancel}</Button>
-            <Button type="submit" disabled={pending || !agents.some(item => item.id === agent) || !name.trim()}>
+            {route && <div className="a13n-qq-actions a13n-route-maintenance">
+              {can("run") && <Button type="button" variant="destructive-outline" disabled={disabled}
+                onClick={() => setConfirming("reset")}>{text.resetConversations}</Button>}
+              <Button type="button" variant="destructive-outline"
+                disabled={disabled} onClick={() => setConfirming("delete")}>{text.remove}</Button>
+            </div>}
+            <Button type="button" variant="outline" disabled={disabled} onClick={() => navigate(back)}>{text.cancel}</Button>
+            <Button type="submit" disabled={disabled || !agents.some(item => item.id === agent) || !name.trim()}>
               {text.save}
             </Button>
           </div>
         </>}
       </form>
-      {route && deleting && <RouteDelete route={route} text={text} dismiss={() => setDeleting(false)} onDeleted={returnToList} />}
+      {route && confirming && <RouteConfirmation route={route} action={confirming} text={text}
+        dismiss={() => setConfirming(null)} onConfirmed={finishAction} />}
     </Page>
   );
 }

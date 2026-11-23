@@ -23,6 +23,10 @@ SCHEMA = """
         binding_id TEXT NOT NULL, principal_id TEXT
     );
     CREATE INDEX IF NOT EXISTS channel_routes_workspace ON channel_routes (workspace_id);
+    CREATE TABLE IF NOT EXISTS channel_route_context_resets (
+        route_id TEXT PRIMARY KEY REFERENCES channel_routes(id) ON DELETE CASCADE,
+        generation INTEGER NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS channel_threads (
         binding_id TEXT NOT NULL, channel_id TEXT NOT NULL, account_id TEXT NOT NULL,
         kind TEXT NOT NULL, conversation_id TEXT NOT NULL, thread_id TEXT NOT NULL,
@@ -139,6 +143,7 @@ class Route(RouteInput):
     id: str
     binding_id: str
     principal_id: str | None
+    context_generation: int = Field(default=0, exclude=True)
 
 
 def github_channel_ids(db: sqlite3.Connection, workspace_id: str) -> set[str]:
@@ -147,7 +152,12 @@ def github_channel_ids(db: sqlite3.Connection, workspace_id: str) -> set[str]:
 
 def read_routes(db: sqlite3.Connection, workspace_id: str) -> list[Route]:
     routes = []
-    for row in db.execute("SELECT * FROM channel_routes WHERE workspace_id = ? ORDER BY name, id", (workspace_id,)):
+    for row in db.execute(
+        """SELECT route.*, COALESCE(reset.generation, 0) AS context_generation
+           FROM channel_routes route LEFT JOIN channel_route_context_resets reset ON reset.route_id = route.id
+           WHERE route.workspace_id = ? ORDER BY route.name, route.id""",
+        (workspace_id,),
+    ):
         config = json.loads(row["sources"])
         routes.append(
             Route(
@@ -157,6 +167,7 @@ def read_routes(db: sqlite3.Connection, workspace_id: str) -> list[Route]:
                 name=row["name"],
                 agent_id=row["agent_id"],
                 enabled=bool(row["enabled"]),
+                context_generation=row["context_generation"],
                 **config,
             )
         )

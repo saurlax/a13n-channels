@@ -623,6 +623,14 @@ def definition() -> AppDefinition:
     async def add_route(body: RouteInput, runtime: CurrentRuntime, actor: Actor, workspace_id: WorkspaceId) -> dict:
         return await save_route(body, runtime, actor, workspace_id, new_object_id("chroute"), create=True)
 
+    @router.post("/routes/{route_id}/reset-conversations", name="reset_channel_conversations", status_code=204)
+    async def reset_conversations(
+        route_id: ChannelId, runtime: CurrentRuntime, actor: Actor, workspace_id: WorkspaceId
+    ) -> None:
+        scope = await writable_scope(runtime, actor, workspace_id)
+        authorize(actor, scope, "run")
+        await require_channels().store.reset_conversations(scope.workspace_id, route_id)
+
     @router.put("/routes/{route_id}", name="update_channel_route")
     async def edit_route(
         route_id: ChannelId,

@@ -269,6 +269,31 @@ class Accounts:
 
         await asyncio.to_thread(delete)
 
+    async def reset_conversations(self, workspace_id: str, route_id: str) -> None:
+        def reset() -> None:
+            with self.transaction() as db:
+                row = db.execute(
+                    """UPDATE channel_routes SET sources = json_remove(sources, '$.fixed_thread_id')
+                       WHERE workspace_id = ? AND id = ? RETURNING binding_id""",
+                    (workspace_id, route_id),
+                ).fetchone()
+                if row is None:
+                    raise not_found("channel_route", route_id)
+                db.execute(
+                    """INSERT INTO channel_route_context_resets (route_id, generation) VALUES (?, 1)
+                       ON CONFLICT (route_id) DO UPDATE SET generation = generation + 1""",
+                    (route_id,),
+                )
+                db.execute("DELETE FROM channel_threads WHERE binding_id = ?", (row["binding_id"],))
+                db.execute(
+                    """UPDATE channel_deliveries SET destination = json_array('route', binding_id)
+                       WHERE route_id = ? AND binding_id = ? AND status IN ('wake_queued', 'wake_submitted', 'queued')
+                           AND tool_key IS NULL AND json_extract(destination, '$[0]') = 'thread'""",
+                    (route_id, row["binding_id"]),
+                )
+
+        await asyncio.to_thread(reset)
+
     @staticmethod
     def _stop_deliveries(db: sqlite3.Connection, route_id: str) -> None:
         db.execute(

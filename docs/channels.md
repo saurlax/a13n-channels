@@ -92,6 +92,8 @@ Each matched message is submitted as one user input containing its source metada
 
 **Context retention (seconds)** defaults to 3600 for new and existing routes. For Threads created by Channels, the next qualifying message starts a fresh Session once the Thread and its child work have been idle for the configured time. Earlier Sessions remain available in Console. Per-message routes always start fresh, and fixed routes with an explicit Thread ID continue targeting that Thread.
 
+In a route's editor, select **Reset conversations** and confirm to clear that route's Thread bindings and explicit fixed Thread ID immediately. Subsequent deliveries start fresh Threads according to the route's Thread policy. Active Runs and submissions already prepared for retry finish against their original Threads. Earlier Sessions remain available in Console.
+
 A new target Agent or saving user resets the route's managed Thread bindings. An explicit fixed Thread ID continues to target that Thread. Changing the Thread destination requires pending deliveries to settle.
 
 The plugin submits directly through the host Service and uses the same idempotency key when retrying an uncertain submission.
