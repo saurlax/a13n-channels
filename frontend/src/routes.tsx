@@ -1,5 +1,5 @@
 import {
-  React, ApiError, Badge, Button, ChoiceField, Empty, ErrorPage, Input, Link, Loading, Page, Switch,
+  React, ApiError, Badge, Button, ChoiceField, Empty, ErrorPage, FormField, Input, Link, Loading, Page, Switch,
   useAccess, useApp, useNavigate, useQuery, useQueryClient, useTranslation,
 } from "@a13n/console";
 import { ChannelIcon, type Platform } from "./channel-icon";
@@ -320,9 +320,6 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
   const [policy, setPolicy] = React.useState<ThreadPolicy>(route?.thread_policy ?? "conversation");
   const [threadId, setThreadId] = React.useState(route?.fixed_thread_id ?? "");
   const [contextIdle, setContextIdle] = React.useState(String(route?.context_idle_seconds ?? 3600));
-  const threadHelpId = React.useId();
-  const contextIdleHelpId = React.useId();
-  const enabledId = React.useId();
   const [enabled, setEnabled] = React.useState(route?.enabled ?? true);
   const [sources, setSources] = React.useState(
     () => (route ? draftSources(route.sources) : [sourceDefaults()]).map((value, id) => ({ id, value })),
@@ -414,8 +411,10 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
     <Page title={route?.name ?? text.add} back={back} backLabel={text.routes}>
       <form className="a13n-route-form" onSubmit={submit}>
         <div className="a13n-route-settings">
-          <label>{text.name}<Input required maxLength={80} disabled={disabled}
-            value={name} onChange={event => setName(event.currentTarget.value)} /></label>
+          <FormField label={text.name} data-field-layout="stacked" className="a13n-route-text-field">
+            <Input required maxLength={80} disabled={disabled}
+              value={name} onChange={event => setName(event.currentTarget.value)} />
+          </FormField>
           <ChoiceField label={text.agent} required disabled={disabled} value={agent || undefined}
             placeholder={text.selectAgent} onValueChange={value => { setAgent(value); if (value === wakeAgent) setWakeAgent(""); }}
             options={[
@@ -423,25 +422,21 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
               ...(agent && !agents.some(item => item.id === agent)
                 ? [{ value: agent, label: `${text.missing} (${agent})`, disabled: true }] : []),
             ]} />
-          <div className="a13n-route-enabled">
-            <label htmlFor={enabledId}>{text.enable}</label>
-            <Switch id={enabledId} checked={enabled} disabled={disabled} onCheckedChange={setEnabled} />
-          </div>
+          <FormField label={text.enable} data-field-layout="setting" className="a13n-route-enabled">
+            <Switch checked={enabled} disabled={disabled} onCheckedChange={setEnabled} />
+          </FormField>
         </div>
-        <section className="a13n-route-sources" aria-label={text.threadPolicy}>
-          <div className="a13n-route-settings">
-            <ChoiceField label={text.threadPolicy} disabled={disabled} value={policy}
-              aria-describedby={threadHelpId} onValueChange={value => setPolicy(value as ThreadPolicy)}
-              options={threadPolicies.map(value => ({ value, label: text.policies[value] }))} />
-            {policy === "fixed" && <label>{text.fixedThreadId}<Input disabled={disabled} maxLength={512}
-              value={threadId} onChange={event => setThreadId(event.currentTarget.value)}
-              aria-describedby={threadHelpId} /></label>}
-            {managesContext && <label>{text.contextIdle}<Input type="number" required disabled={disabled}
-              min={1} max={Number.MAX_SAFE_INTEGER} step={1} value={contextIdle}
-              onChange={event => setContextIdle(event.currentTarget.value)} aria-describedby={contextIdleHelpId} /></label>}
-          </div>
-          <p id={threadHelpId} className="a13n-route-thread-help">{text.policyHelp[policy]}</p>
-          {managesContext && <p id={contextIdleHelpId} className="a13n-route-thread-help">{text.contextIdleHelp}</p>}
+        <section className="a13n-route-settings" aria-label={text.threadPolicy}>
+          <ChoiceField label={text.threadPolicy} description={text.policyHelp[policy]} disabled={disabled} value={policy}
+            onValueChange={value => setPolicy(value as ThreadPolicy)}
+            options={threadPolicies.map(value => ({ value, label: text.policies[value] }))} />
+          {policy === "fixed" && <FormField label={text.fixedThreadId} data-field-layout="stacked" className="a13n-route-text-field">
+            <Input disabled={disabled} maxLength={512} value={threadId} onChange={event => setThreadId(event.currentTarget.value)} />
+          </FormField>}
+          {managesContext && <FormField label={text.contextIdle} description={text.contextIdleHelp} data-field-layout="setting">
+            <Input type="number" required disabled={disabled} min={1} max={Number.MAX_SAFE_INTEGER} step={1}
+              value={contextIdle} onChange={event => setContextIdle(event.currentTarget.value)} />
+          </FormField>}
         </section>
         <section className="a13n-route-sources" aria-label={text.sources}>
           <div className="a13n-route-section-header">
@@ -479,7 +474,7 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
                 { value: "all", label: text.allMessages },
                 ...(legacyFilters ? [{ value: "legacy", label: text.originalFilters }] : []),
               ]} />
-            <ChoiceField label={text.wakeAgent} disabled={disabled} value={wakeAgent || "none"}
+            <ChoiceField label={text.wakeAgent} description={text.wakeHelp} disabled={disabled} value={wakeAgent || "none"}
               onValueChange={value => setWakeAgent(value === "none" ? "" : value)}
               options={[
                 { value: "none", label: text.noWakeAgent },
@@ -488,7 +483,6 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
                   ? [{ value: wakeAgent, label: `${text.missing} (${wakeAgent})`, disabled: true }] : []),
               ]} />
           </div>
-          <p className="a13n-route-thread-help">{text.wakeHelp}</p>
           <div className="a13n-route-section-header">
             <h3>{text.allowedUsers}</h3>
             {canEdit && <Button type="button" size="sm" variant="outline" disabled={disabled || !accounts.length || allowedUsers.length >= 100}
