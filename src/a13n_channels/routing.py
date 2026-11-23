@@ -26,7 +26,6 @@ SCHEMA = """
     CREATE TABLE IF NOT EXISTS channel_threads (
         binding_id TEXT NOT NULL, channel_id TEXT NOT NULL, account_id TEXT NOT NULL,
         kind TEXT NOT NULL, conversation_id TEXT NOT NULL, thread_id TEXT NOT NULL,
-        last_submitted_at REAL NOT NULL DEFAULT 0,
         PRIMARY KEY (binding_id, channel_id, account_id, kind, conversation_id)
     );
     CREATE TABLE IF NOT EXISTS channel_deliveries (

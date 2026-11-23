@@ -2,7 +2,6 @@ import asyncio
 import base64
 import json
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -272,7 +271,7 @@ def test_matched_text_retries_same_submission_and_reuses_source_thread(
                     invocation,
                     SimpleNamespace(
                         thread=SimpleNamespace(id="thread-" + metadata["conversation_id"]),
-                        entry=SimpleNamespace(id=identifier, created_at=datetime.now(UTC)),
+                        entry=SimpleNamespace(id=identifier),
                     ),
                 )
                 if identifier == "first":
@@ -293,6 +292,7 @@ def test_matched_text_retries_same_submission_and_reuses_source_thread(
             return SimpleNamespace(status="completed", resumed_by_id=None)
 
         monkeypatch.setattr(delivery, "short_session", session)
+        monkeypatch.setattr(Deliveries, "has_context_activity", AsyncMock(return_value=True))
         monkeypatch.setattr(delivery, "principal_for", owner)
         monkeypatch.setattr(delivery, "resolve_model", model)
         monkeypatch.setattr(delivery, "open_attachment", download)
@@ -383,8 +383,7 @@ def test_thread_destination_controls_reuse_and_queue_order(
             name = channel_input(message)[0]["message_id"]
             target = thread_id or f"new-{name}"
             submissions[name] = target
-            entry = SimpleNamespace(id=name, created_at=datetime.now(UTC))
-            return SimpleNamespace(thread=SimpleNamespace(id=target), entry=entry), True
+            return SimpleNamespace(thread=SimpleNamespace(id=target), entry=SimpleNamespace(id=name)), True
 
         async def create(_runtime, _actor, _workspace, message, *, request_key):
             return accept(message)
@@ -402,6 +401,7 @@ def test_thread_destination_controls_reuse_and_queue_order(
         monkeypatch.setattr(delivery.submit, "submit_message", append)
         monkeypatch.setattr(Deliveries, "actor", actor)
         monkeypatch.setattr(Deliveries, "collect", collect)
+        monkeypatch.setattr(Deliveries, "has_context_activity", AsyncMock(return_value=True))
         deliveries = Deliveries(store, SimpleNamespace(storage=None), AsyncMock())
         await deliveries.process({"channel": account})
         assert len(submissions) == first_batch
@@ -435,20 +435,18 @@ def test_managed_thread_rolls_over_after_idle_and_freezes_retry(tmp_path, monkey
             submissions.append((name, None, request_key))
             if name == "expired" and len(submissions) == 4:
                 raise ServiceError("unavailable", "Retry this submission.")
-            entry = SimpleNamespace(id=name, created_at=datetime.fromtimestamp(clock.now, UTC))
-            return SimpleNamespace(thread=SimpleNamespace(id=f"new-{name}"), entry=entry), True
+            return SimpleNamespace(thread=SimpleNamespace(id=f"new-{name}"), entry=SimpleNamespace(id=name)), True
 
         async def append(_runtime, _actor, _workspace, thread_id, message, *, request_key):
             name = channel_input(message)[0]["message_id"]
             submissions.append((name, thread_id, request_key))
-            entry = SimpleNamespace(id=name, created_at=datetime.fromtimestamp(clock.now, UTC))
-            return SimpleNamespace(thread=SimpleNamespace(id=thread_id), entry=entry), True
+            return SimpleNamespace(thread=SimpleNamespace(id=thread_id), entry=SimpleNamespace(id=name)), True
 
         monkeypatch.setattr(delivery.submit, "create_thread", create)
         monkeypatch.setattr(delivery.submit, "submit_message", append)
         monkeypatch.setattr(Deliveries, "actor", AsyncMock(return_value=object()))
         monkeypatch.setattr(Deliveries, "collect", AsyncMock())
-        activity = AsyncMock(side_effect=[True, False])
+        activity = AsyncMock(side_effect=[True, True, False])
         monkeypatch.setattr(Deliveries, "has_context_activity", activity)
         deliveries = Deliveries(store, SimpleNamespace(storage=None), AsyncMock())
 
@@ -463,7 +461,7 @@ def test_managed_thread_rolls_over_after_idle_and_freezes_retry(tmp_path, monkey
             ("active", "new-first"),
             ("expired", None),
         ]
-        assert [call.args[2].timestamp() for call in activity.await_args_list] == [109, 119]
+        assert [call.args[2].timestamp() for call in activity.await_args_list] == [99, 109, 119]
         assert (await store.query("SELECT thread_id FROM channel_threads"))[0]["thread_id"] == "new-first"
 
         route = route.model_copy(update={"context_idle_seconds": 3600})
@@ -554,8 +552,7 @@ def test_wake_filter_runs_before_the_main_agent(output, expected, tmp_path, monk
 
         async def create(_runtime, _actor, _workspace, body, *, request_key):
             submitted.append((body, request_key))
-            entry = SimpleNamespace(id="inb_new", created_at=datetime.now(UTC))
-            return SimpleNamespace(thread=SimpleNamespace(id="thr_new"), entry=entry), True
+            return SimpleNamespace(thread=SimpleNamespace(id="thr_new"), entry=SimpleNamespace(id="inb_new")), True
 
         async def entry(*_args):
             return SimpleNamespace(assigned_run_id="run_wake")

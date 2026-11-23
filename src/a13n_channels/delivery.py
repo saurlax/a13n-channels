@@ -361,27 +361,21 @@ class Deliveries:
                 NewThread.model_validate(body),
                 request_key=key,
             )
-        await asyncio.to_thread(
-            self.save_receipt, job, scope, receipt.thread.id, receipt.entry.id, receipt.entry.created_at.timestamp()
-        )
+        await asyncio.to_thread(self.save_receipt, job, scope, receipt.thread.id, receipt.entry.id)
 
     async def retained_thread(
         self, workspace_id: str, scope: tuple[str, str, str, str, str], idle_seconds: int
     ) -> str | None:
         threads = await self.store.query(
-            """SELECT thread_id, last_submitted_at FROM channel_threads
+            """SELECT thread_id FROM channel_threads
                WHERE binding_id = ? AND channel_id = ? AND account_id = ? AND kind = ? AND conversation_id = ?""",
             *scope,
         )
         if not threads:
             return None
-        thread = threads[0]
-        cutoff = time.time() - idle_seconds
-        if thread["last_submitted_at"] > cutoff or await self.has_context_activity(
-            workspace_id, thread["thread_id"], datetime.fromtimestamp(cutoff, UTC)
-        ):
-            return thread["thread_id"]
-        return None
+        thread_id = threads[0]["thread_id"]
+        cutoff = datetime.fromtimestamp(max(time.time() - idle_seconds, 0), UTC)
+        return thread_id if await self.has_context_activity(workspace_id, thread_id, cutoff) else None
 
     async def has_context_activity(self, workspace_id: str, thread_id: str, cutoff: datetime) -> bool:
         # The Host owns run and inbox state, including child work after a coordinator yields.
@@ -408,7 +402,11 @@ class Deliveries:
                     select(InboxEntryRow.id)
                     .where(
                         InboxEntryRow.thread_id == family.c.id,
-                        or_(InboxEntryRow.finished_at.is_(None), InboxEntryRow.finished_at > cutoff),
+                        or_(
+                            InboxEntryRow.finished_at.is_(None),
+                            InboxEntryRow.finished_at > cutoff,
+                            InboxEntryRow.created_at > cutoff,
+                        ),
                     )
                     .exists(),
                 )
@@ -498,7 +496,6 @@ class Deliveries:
         scope: tuple[str, str, str, str, str] | None,
         thread_id: str,
         entry_id: str,
-        submitted_at: float,
     ) -> None:
         with self.store.transaction() as db:
             saved = db.execute(
@@ -510,11 +507,11 @@ class Deliveries:
             if saved and scope is not None:
                 db.execute(
                     """INSERT INTO channel_threads
-                       (binding_id, channel_id, account_id, kind, conversation_id, thread_id, last_submitted_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)
+                       (binding_id, channel_id, account_id, kind, conversation_id, thread_id)
+                       VALUES (?, ?, ?, ?, ?, ?)
                        ON CONFLICT (binding_id, channel_id, account_id, kind, conversation_id) DO UPDATE SET
-                           thread_id = excluded.thread_id, last_submitted_at = excluded.last_submitted_at""",
-                    (*scope, thread_id, submitted_at),
+                           thread_id = excluded.thread_id""",
+                    (*scope, thread_id),
                 )
 
     def claim_failure_notice(self, delivery_id: str, status: str, text: str) -> bool:
