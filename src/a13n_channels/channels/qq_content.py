@@ -447,7 +447,7 @@ def validate_rich(kind: str, text: str | None, rich: QQRichContent | None) -> No
         if rich.kind != "image" and kind in {"guild", "guild_dm"}:
             raise ValueError("QQ guild media supports images.")
         if text and rich.kind != "image":
-            raise ValueError("Send non-image media and text as separate messages.")
+            raise ValueError("Send voice, video, and files separately from text. Images can include a caption.")
     elif text:
         raise ValueError("Supply the Markdown or card as rich content without a separate text field.")
     elif isinstance(rich, QQEmbed) and not rich.card:

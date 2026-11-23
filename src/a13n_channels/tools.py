@@ -377,7 +377,11 @@ class WorkspaceChannelTools(AbstractHarnessPlugin):
         text: ReplyText | None = None,
         rich: QQRichContent | None = None,
     ) -> dict:
-        """Send text, media, Markdown, or a card to a QQ conversation without a source message."""
+        """Send to a QQ conversation without a source message.
+
+        Use text alone for plain text, rich alone for an image, or both for an image with a caption.
+        Send voice, video, and files separately from text. Use rich alone for Markdown and cards.
+        """
         active, account = await self.account(ctx, channel_id, sending=True)
         if account["platform"] != "qq":
             return {"status": "unsupported", "reason": "Proactive sending is supported for QQ."}
@@ -557,7 +561,11 @@ class ChannelTools(AbstractHarnessPlugin):
         rich: QQRichContent | None = None,
         reference_message_id: MessageId | None = None,
     ) -> dict:
-        """Reply to the message that started this run. QQ supports rich content and reference_message_id quotes."""
+        """Reply to the message that started this run. Use text alone for plain text.
+
+        On QQ, use rich alone for an image or add text as its caption. Send voice, video, and files separately
+        from text. QQ also supports Markdown, cards, and reference_message_id quotes.
+        """
         active, account, job = await self.source(ctx, from_trigger=True)
         if ctx.tool_call_id is None:
             raise ModelRetry("A recorded tool call is required to send a message.")

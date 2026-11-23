@@ -124,7 +124,7 @@ The configured Channels tools are available in regular, scheduled, and routed ru
 
 ## QQ images, stickers, records, and cards
 
-Use `channel_send_message` with `rich` set to one of the following objects. `channel_send_proactive` accepts the same content.
+`channel_send_message` and `channel_send_proactive` accept `text` alone for a plain-text message and `rich` alone for a standalone image. Supply both `text` and an image `rich` object to send the image and its caption in one message. Send voice, video, and files in a separate call from any accompanying text.
 
 | Content | Example `rich` value |
 | --- | --- |
@@ -135,7 +135,7 @@ Use `channel_send_message` with `rich` set to one of the following objects. `cha
 | Markdown template | `{"type":"markdown","custom_template_id":"TEMPLATE_ID","params":[{"key":"title","values":["Status"]}]}` |
 | Ark or Embed card | `{"type":"ark","card":{"template_id":23,"kv":[{"key":"#DESC#","value":"Status"}]}}` |
 
-An image can include `text` as a caption. Send captions for other media separately. QQ C2C and group sends upload bytes or a URL to obtain a media receipt. Large files use QQ's multipart upload flow. Guild and guild DM media use the image field or an image file. The QQ reply API accepts the same text and rich message objects with HTTPS URLs for media. QQ controls availability of file types, custom cards, keyboards, quotes, and proactive messages for each bot and conversation.
+QQ C2C and group sends upload bytes or a URL to obtain a media receipt. Large files use QQ's multipart upload flow. Guild and guild DM media use the image field or an image file. The QQ reply API accepts the same text and rich message objects with HTTPS URLs for media. QQ controls availability of file types, custom cards, keyboards, quotes, and proactive messages for each bot and conversation.
 
 QQ history preserves images, custom sticker markers, emoji labels, audio, video, files, quotes, cards, and forwarded chat records supplied in Gateway events. Attachment URLs stay private. Pass `message_id` and the reported one-based `index` to `channel_get_attachment` to inspect an image or sticker. Supply an absolute Environment `save_path` for other attachments or to save a larger image. For older messages in the same conversation, identify the current delivery with `source_message_id`. Temporary QQ links can expire. A fresh message supplies a new link.
 
