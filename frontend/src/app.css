@@ -245,11 +245,19 @@
   margin-top: 12px;
 }
 
-.a13n-weixin-qr {
+.a13n-pairing-qr {
   width: min(100%, 240px);
   aspect-ratio: 1;
   margin-inline: auto;
   background: white;
+}
+
+.a13n-pairing-qr-placeholder {
+  display: grid;
+  place-items: center;
+  background: var(--a13n-surface);
+  border: 1px dashed var(--a13n-border);
+  border-radius: 8px;
 }
 
 .a13n-qq-authorized {

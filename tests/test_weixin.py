@@ -15,11 +15,12 @@ from a13n_service.tenancy.authorize import WorkspaceScope
 from pydantic import SecretStr
 
 from a13n_channels import app
-from a13n_channels.channels.weixin import PairingPoll, WeixinCreate
+from a13n_channels.channels.weixin import PairingPoll, PairingSave, WeixinCreate
 from a13n_channels.messages import TextReply
 
 
-def test_weixin_pairing_and_text_exchange(monkeypatch, tmp_path):
+@pytest.mark.parametrize("new_channel", [False, True])
+def test_weixin_pairing_and_text_exchange(monkeypatch, tmp_path, new_channel):
     polled = asyncio.Event()
     wx_token = "fixture-token"
     context = "fixture-context"
@@ -30,6 +31,7 @@ def test_weixin_pairing_and_text_exchange(monkeypatch, tmp_path):
         match request.url.path.removeprefix("/ilink/bot/"):
             case "get_bot_qrcode":
                 assert request.url.params["bot_type"] == "3"
+                assert json.loads(request.content) == {"local_token_list": []}
                 return httpx.Response(200, json={"qrcode": "opaque", "qrcode_img_content": "https://weixin.qq.com/qr"})
             case "get_qrcode_status":
                 assert request.url.params["qrcode"] == "opaque"
@@ -87,7 +89,7 @@ def test_weixin_pairing_and_text_exchange(monkeypatch, tmp_path):
         yield SimpleNamespace(execute=execute)
 
     async def authorize(_session, actor, workspace, verb):
-        assert actor == "writer" and verb == "write"
+        assert actor.id in {"writer", "other-writer"} and verb == "write"
         return WorkspaceScope("org", workspace)
 
     def client(**kwargs):
@@ -112,28 +114,53 @@ def test_weixin_pairing_and_text_exchange(monkeypatch, tmp_path):
     async def exercise():
         async with AsyncExitStack() as stack:
             await definition.startup(runtime, stack)
-            workspace = (runtime, "writer", "ws_wx")
-            account = await endpoints["add_weixin_channel"](WeixinCreate(name="Weixin"), *workspace)
-            assert account.platform == "weixin" and account.state == "login_required"
-            with pytest.raises(ServiceError, match="weixin_channel"):
-                await endpoints["start_weixin_pairing"](account.id, runtime, "writer", "ws_other")
-            start = await endpoints["start_weixin_pairing"](account.id, *workspace)
+            writer = SimpleNamespace(id="writer")
+            workspace = (runtime, writer, "ws_wx")
+            list_accounts = endpoints["list_channel_accounts"]
+            if new_channel:
+                begin = endpoints["start_new_weixin_pairing"]
+                poll = endpoints["poll_new_weixin_pairing"]
+                save = endpoints["save_new_weixin_pairing"]
+                cancel = endpoints["cancel_new_weixin_pairing"]
+                channel_args = ()
+                discarded = await begin(*workspace)
+                await cancel(discarded.login_id, *workspace)
+                assert (await poll(PairingPoll(login_id=discarded.login_id), *workspace)).status == "expired"
+            else:
+                account = await endpoints["add_weixin_channel"](WeixinCreate(name="Weixin"), *workspace)
+                assert account.platform == "weixin" and account.state == "login_required"
+                begin = endpoints["start_weixin_pairing"]
+                poll = endpoints["poll_weixin_pairing"]
+                save = endpoints["save_weixin_pairing"]
+                channel_args = (account.id,)
+                with pytest.raises(ServiceError, match="weixin_channel"):
+                    await begin(account.id, runtime, writer, "ws_other")
+
+            start = await begin(*channel_args, *workspace)
             assert start.qr_image.startswith("data:image/svg+xml;base64,")
-            poll = endpoints["poll_weixin_pairing"]
-            assert (
-                await poll(account.id, PairingPoll(login_id=start.login_id), *workspace)
-            ).status == "need_verifycode"
+            check = PairingPoll(login_id=start.login_id)
+            assert (await poll(*channel_args, check, *workspace)).status == "need_verifycode"
             proof = PairingPoll(login_id=start.login_id, verify_code="1234")
-            assert (await poll(account.id, proof, *workspace)).status == "confirmed"
-            unpaired = (await endpoints["list_channel_accounts"]("ws_wx")).accounts[0]
-            assert unpaired.account_id is None
-            assert unpaired.conversation_kinds == ("private",)
-            save = endpoints["save_weixin_pairing"]
-            assert (await save(account.id, proof, *workspace)).status == "confirmed"
-            assert (await poll(account.id, proof, *workspace)).status == "expired"
+            assert (await poll(*channel_args, proof, *workspace)).status == "confirmed"
+            unpaired = (await list_accounts("ws_wx")).accounts
+            if new_channel:
+                assert unpaired == []
+                other = SimpleNamespace(id="other-writer")
+                assert (await poll(check, runtime, other, "ws_wx")).status == "expired"
+                assert (await poll(check, runtime, writer, "ws_other")).status == "expired"
+                with pytest.raises(ServiceError, match="channel name"):
+                    await save(PairingSave(login_id=start.login_id), *workspace)
+            else:
+                assert unpaired[0].account_id is None
+                assert unpaired[0].conversation_kinds == ("private",)
+            final = PairingSave(login_id=start.login_id, name="Weixin" if new_channel else None)
+            assert (await save(*channel_args, final, *workspace)).status == "confirmed"
+            assert (await poll(*channel_args, proof, *workspace)).status == "expired"
             await asyncio.wait_for(polled.wait(), timeout=2)
             listed = (await endpoints["list_channel_accounts"]("ws_wx")).accounts
-            assert listed[0].account_id == "bot1" and listed[0].state == "login_required"
+            assert len(listed) == 1
+            account = listed[0]
+            assert account.name == "Weixin" and account.account_id == "bot1" and account.state == "login_required"
             messages = await endpoints["list_weixin_messages"](account.id, "ws_wx")
             assert [message.text for message in messages] == ["hello"]
             assert context not in messages[0].model_dump_json()
