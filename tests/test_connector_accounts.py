@@ -80,6 +80,13 @@ def test_connector_uses_shared_accounts_ingestion_and_reply(tmp_path, monkeypatc
             assert delivery["message_id"] == "test"
             (cursor,) = await store.query("SELECT cursor FROM connector_accounts")
             assert cursor["cursor"] == "2"
+            assert await store.rename(scope.workspace_id, view.id, "Renamed connector")
+            (renamed,) = await store.query("SELECT * FROM channel_accounts WHERE id = ?", view.id)
+            assert (renamed["name"], renamed["credentials"], renamed["cursor"]) == (
+                "Renamed connector",
+                account["credentials"],
+                "2",
+            )
             assert await runtime.send_reply(account, "test", "Hello") == "reply-id"
             assert replies == [("test", "Hello", {"reply_token": "private-token"})]
 

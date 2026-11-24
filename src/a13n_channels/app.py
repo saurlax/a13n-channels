@@ -26,7 +26,7 @@ from a13n_service.tenancy.authorize import authorize
 from a13n_service.tenancy.requests import Actor, CurrentRuntime, WorkspaceId
 from a13n_service.tenancy.tables import OrganizationRow, WorkspaceRow
 from fastapi import Query
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, StringConstraints
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from websockets.exceptions import WebSocketException
@@ -105,6 +105,12 @@ class ChannelList(BaseModel):
     accounts: list[ChannelAccount]
     qq_scan_available: bool = False
     connectors: list[ConnectorDescription] = Field(default_factory=list)
+
+
+class ChannelRename(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=80)]
 
 
 class ChannelsRuntime:
@@ -466,6 +472,16 @@ def definition() -> AppDefinition:
                 for item in ADAPTERS.values()
             ],
         )
+
+    @router.patch("/accounts/{channel_id}", name="rename_channel_account")
+    async def rename_channel(
+        channel_id: ChannelId, body: ChannelRename, runtime: CurrentRuntime, actor: Actor, workspace_id: WorkspaceId
+    ) -> ChannelRename:
+        await writable_scope(runtime, actor, workspace_id)
+        active = require_channels()
+        if not await active.store.rename(workspace_id, channel_id, body.name):
+            raise not_found("channel", channel_id)
+        return body
 
     @router.post("/connectors/{platform}/accounts", status_code=201)
     async def add_connector(

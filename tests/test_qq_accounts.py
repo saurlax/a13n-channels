@@ -99,6 +99,7 @@ def test_qq_accounts_and_messages_are_owned_by_the_workspace(tmp_path, monkeypat
             await definition.startup(runtime, stack)
             list_accounts = endpoints["list_qq_accounts"]
             create = endpoints["add_qq_account"]
+            rename = endpoints["rename_channel_account"]
             update = endpoints["update_qq_account"]
             delete = endpoints["delete_qq_account"]
             messages = endpoints["list_qq_messages"]
@@ -123,6 +124,22 @@ def test_qq_accounts_and_messages_are_owned_by_the_workspace(tmp_path, monkeypat
                 "guild_dm",
             )
             assert (await list_accounts("ws_other")).accounts == []
+            new_name = app.ChannelRename(name="  QQ support  ")
+            allowed = False
+            with pytest.raises(ServiceError, match="Workspace write required"):
+                await rename(account.id, new_name, runtime, "writer", "ws_qq")
+            allowed = True
+            with pytest.raises(ServiceError, match="channel"):
+                await rename(account.id, new_name, runtime, "writer", "ws_other")
+            assert (await list_accounts("ws_qq")).accounts[0].name == account.name
+            assert (await rename(account.id, new_name, runtime, "writer", "ws_qq")).name == "QQ support"
+            renamed = (await endpoints["list_channel_accounts"]("ws_qq")).accounts[0]
+            assert (renamed.id, renamed.name, renamed.account_id, renamed.state) == (
+                account.id,
+                "QQ support",
+                account.app_id,
+                "connected",
+            )
             with pytest.raises(ServiceError, match="qq_channel"):
                 await messages(account.id, "ws_other")
             with pytest.raises(ServiceError, match="qq_channel"):
@@ -138,7 +155,7 @@ def test_qq_accounts_and_messages_are_owned_by_the_workspace(tmp_path, monkeypat
             edited = await update(
                 account.id, app.QQEdit(app_id="10002", app_secret="updated"), runtime, "writer", "ws_qq"
             )
-            assert (edited.id, edited.name, edited.app_id) == (account.id, account.name, "10002")
+            assert (edited.id, edited.name, edited.app_id) == (account.id, new_name.name, "10002")
             await asyncio.wait_for(stopped.wait(), timeout=2)
             assert await messages(account.id, "ws_qq") == []
             with pytest.raises(ServiceError, match="qq_message"):

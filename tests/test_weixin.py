@@ -128,12 +128,14 @@ def test_weixin_pairing_and_text_exchange(monkeypatch, tmp_path):
             unpaired = (await endpoints["list_channel_accounts"]("ws_wx")).accounts[0]
             assert unpaired.account_id is None
             assert unpaired.conversation_kinds == ("private",)
+            await endpoints["rename_channel_account"](account.id, app.ChannelRename(name="Weixin support"), *workspace)
             save = endpoints["save_weixin_pairing"]
             assert (await save(account.id, proof, *workspace)).status == "confirmed"
             assert (await poll(account.id, proof, *workspace)).status == "expired"
             await asyncio.wait_for(polled.wait(), timeout=2)
             listed = (await endpoints["list_channel_accounts"]("ws_wx")).accounts
             assert listed[0].account_id == "bot1" and listed[0].state == "login_required"
+            assert listed[0].name == "Weixin support"
             messages = await endpoints["list_weixin_messages"](account.id, "ws_wx")
             assert [message.text for message in messages] == ["hello"]
             assert context not in messages[0].model_dump_json()

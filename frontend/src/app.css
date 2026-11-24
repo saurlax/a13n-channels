@@ -270,14 +270,8 @@
   font-size: 22px;
 }
 
-.a13n-qq-test {
-  display: grid;
-  justify-items: start;
-  gap: 8px;
-}
-
 .a13n-qq-test-center {
-  justify-items: center;
+  text-align: center;
 }
 
 .a13n-channel-delete {
@@ -288,6 +282,24 @@
   display: grid;
   gap: 4px;
   overflow-wrap: anywhere;
+}
+
+.a13n-channel-edit-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.a13n-channel-edit-title > button {
+  flex: none;
+}
+
+.a13n-channel-rename-dialog {
+  width: min(400px, calc(100% - 32px));
+}
+
+.a13n-qq-dialog > .a13n-channel-edit-header + form {
+  margin-top: 16px;
 }
 
 .a13n-channel-edit-header p {

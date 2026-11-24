@@ -17,6 +17,8 @@ Restart Service after changing its settings. The source checkout's `make dev` la
 
 Enable **Channels** under **Settings → Organization → App plugins**. In **Apps → Channels**, select **Add channel**, choose a platform, and enter its credentials or complete pairing. Check the account's connection status before creating a delivery route.
 
+To change an account's display name, open its channel row, select the pencil next to its name, and save the new name.
+
 ### QQ bot credentials
 
 In **Apps → Channels → Add channel**, choose **QQ Bot** and enter its name, AppID, and AppSecret. Channels connects to QQ using its outbound Gateway protocol. Open the channel row to manage its credentials. Replacing an AppID requires its matching AppSecret. Ordinary group messages require QQ’s receive-all-messages setting. Guild channels require the corresponding QQ permissions.

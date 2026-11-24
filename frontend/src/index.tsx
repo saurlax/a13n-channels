@@ -9,6 +9,7 @@ import "./app.css";
 
 const english = {
   title: "Channels", add: "Add channel", name: "Name", secret: "AppSecret",
+  rename: "Rename channel", nameRequired: "Enter a channel name.", renameError: "Could not save the channel name. Try again.",
   channelType: "Channel type", qq: "QQ Bot", weixin: "Weixin ClawBot", github: "GitHub", github_app: "GitHub App", status: "Status",
   githubToken: "Classic personal access token", privateKey: "Private key (PEM)",
   keepCurrent: "Leave blank to keep the current value",
@@ -30,6 +31,7 @@ const english = {
 
 const chinese: typeof english = {
   title: "渠道", add: "添加渠道", name: "名称", secret: "AppSecret",
+  rename: "重命名渠道", nameRequired: "请输入渠道名称。", renameError: "无法保存渠道名称，请重试。",
   channelType: "渠道类型", qq: "QQ 机器人", weixin: "微信 ClawBot", github: "GitHub", github_app: "GitHub App", status: "状态",
   githubToken: "Classic PAT", privateKey: "密钥",
   keepCurrent: "留空则保留当前值",
@@ -92,17 +94,96 @@ async function requireSuccess(response: Response) {
   return response;
 }
 
-function ChannelEditorHeader({ account, label, titleId }: {
+function ChannelEditorHeader({ account, label, text, titleId }: {
   account: Account;
   label: string;
+  text: typeof english;
   titleId: string;
 }) {
+  const app = useApp();
+  const client = useQueryClient();
+  const dialog = React.useRef<HTMLDialogElement>(null);
+  const [draft, setDraft] = React.useState(account.name);
+  const [pending, setPending] = React.useState(false);
+  const [error, setError] = React.useState("");
+
+  function openRename() {
+    setDraft(account.name);
+    setError("");
+    dialog.current?.showModal();
+  }
+
+  async function saveName(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (pending) return;
+    const name = draft.trim();
+    if (name === account.name) {
+      dialog.current?.close();
+      return;
+    }
+    if (!name) {
+      setError(text.nameRequired);
+      return;
+    }
+    setPending(true);
+    setError("");
+    try {
+      const response = await requireSuccess(await app.request(`/accounts/${encodeURIComponent(account.id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      }));
+      const saved = await response.json() as { name: string };
+      const queryKey = app.queryKey("channel-accounts");
+      client.setQueryData<Accounts>(queryKey, current => current && ({
+        ...current,
+        accounts: current.accounts.map(item => item.id === account.id ? { ...item, name: saved.name } : item),
+      }));
+      dialog.current?.close();
+      void client.invalidateQueries({ queryKey });
+    } catch {
+      setError(text.renameError);
+    } finally {
+      setPending(false);
+    }
+  }
+
   return (
     <header className="a13n-channel-edit-header">
-      <h2 id={titleId}>{account.name}</h2>
+      <div className="a13n-channel-edit-title">
+        <h2 id={titleId}>{account.name}</h2>
+        <Button type="button" variant="ghost" size="icon-xs" aria-label={text.rename} onClick={openRename}>
+          <svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none"
+            stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M15 5l4 4M4 20l4.5-1 11-11a1.4 1.4 0 0 0 0-2l-1.5-1.5a1.4 1.4 0 0 0-2 0l-11 11L4 20Z" />
+          </svg>
+        </Button>
+      </div>
       <p id={`${titleId}-description`} className="a13n-channel-icon-label">
         <ChannelIcon platform={account.platform} />{label}
       </p>
+      <dialog ref={dialog} className="a13n-qq-dialog a13n-channel-rename-dialog"
+        aria-labelledby={`${titleId}-rename`} onCancel={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          if (!pending) dialog.current?.close();
+        }}>
+        <form aria-busy={pending} onSubmit={saveName}>
+          <h2 id={`${titleId}-rename`}>{text.rename}</h2>
+          <label>{text.name}
+            <Input name="name" value={draft} required maxLength={80} readOnly={pending}
+              aria-invalid={Boolean(error)} aria-describedby={error ? `${titleId}-name-error` : undefined}
+              onChange={(event) => { setDraft(event.currentTarget.value); setError(""); }} />
+          </label>
+          {error && <p id={`${titleId}-name-error`} role="alert">{error}</p>}
+          <div className="a13n-qq-actions">
+            <Button type="button" variant="outline" disabled={pending} onClick={() => dialog.current?.close()}>
+              {text.cancel}
+            </Button>
+            <Button type="submit" disabled={pending}>{text.save}</Button>
+          </div>
+        </form>
+      </dialog>
     </header>
   );
 }
@@ -323,10 +404,10 @@ function AccountDialog({ action, text, dismiss, pair, requestDelete, qqScanAvail
     <dialog ref={dialog} className="a13n-qq-dialog" aria-labelledby={titleId}
       aria-describedby={editing ? `${titleId}-description` : undefined}
       onCancel={(event) => { event.preventDefault(); if (!pending) dismiss(); }}>
+      {editing && <ChannelEditorHeader account={action.account} label={platformName(platform, text, connectors)}
+        text={text} titleId={titleId} />}
       <form ref={form} onSubmit={submit}>
-        {editing
-          ? <ChannelEditorHeader account={action.account} label={platformName(platform, text, connectors)} titleId={titleId} />
-          : <h2 id={titleId}>{text.add}</h2>}
+        {add && <h2 id={titleId}>{text.add}</h2>}
         {add && <>
           <label htmlFor={`${titleId}-platform`}>{text.channelType}
             <ChannelSelect id={`${titleId}-platform`} label={text.channelType} container={dialog}
@@ -380,21 +461,18 @@ function AccountDialog({ action, text, dismiss, pair, requestDelete, qqScanAvail
           {!scanFailed && scan?.qr_image && <img className="a13n-weixin-qr" src={scan.qr_image} alt={text.qqQR} />}
           {scanFailed && <Button type="button" variant="outline" onClick={retryScan}>{text.getCode}</Button>}
         </>)}
-        {qqFields && (!scanning || scanReady) && (
-          <div className={scanning ? "a13n-qq-test a13n-qq-test-center" : "a13n-qq-test"}>
-            {connection !== "idle" && <p role={connection === "failed" ? "alert" : "status"}>{
-              testing ? text.testing : connection === "success" ? text.testOK : text.testFailed
-            }</p>}
-            {(!scanning || connection === "failed") &&
-              <Button type="button" variant="outline" size="sm" disabled={pending || testing || (!scanning && !hasSecret)} onClick={() => void testConnection()}>
-                {text.test}
-              </Button>}
-          </div>
-        )}
+        {qqFields && (!scanning || scanReady) && connection !== "idle" &&
+          <p className={scanning ? "a13n-qq-test-center" : undefined}
+            role={connection === "failed" ? "alert" : "status"}>
+            {testing ? text.testing : connection === "success" ? text.testOK : text.testFailed}
+          </p>}
         {failed && <p role="alert">{typeof failed === "string" ? failed : text.error}</p>}
         <div className="a13n-qq-actions">
           {editing && <Button type="button" className="a13n-channel-delete" variant="destructive-outline"
             disabled={pending || testing} onClick={() => requestDelete(action.account)}>{text.remove}</Button>}
+          {qqFields && (!scanning || (scanReady && connection === "failed")) &&
+            <Button type="button" variant="outline" disabled={pending || testing || (!scanning && !hasSecret)}
+              onClick={() => void testConnection()}>{text.test}</Button>}
           <Button type="button" variant="outline" disabled={pending} onClick={dismiss}>{text.cancel}</Button>
           <Button type="submit" disabled={pending || testing || (scanning && !scanReady)}>
             {text.save}
@@ -496,7 +574,7 @@ function PairingDialog({ account, text, dismiss, requestDelete }: {
     <dialog ref={dialog} className="a13n-qq-dialog a13n-weixin-pairing" aria-labelledby={titleId}
       aria-describedby={`${titleId}-description`}
       onCancel={(event) => { event.preventDefault(); if (!pending || status !== "confirmed") dismiss(); }}>
-      <ChannelEditorHeader account={account} text={text} titleId={titleId} />
+      <ChannelEditorHeader account={account} label={text.weixin} text={text} titleId={titleId} />
       {!pairing && <p>{text.scan}</p>}
       {pairing && status !== "confirmed" && !terminal.includes(pairing.status) &&
         <img className="a13n-weixin-qr" src={pairing.qr_image} alt={text.qr} />}
@@ -542,6 +620,10 @@ function Channels({ nav }: { nav: React.ReactNode }) {
   if (!query.data) return <ErrorPage error={query.error} />;
   const { accounts, configured, qq_scan_available, connectors = [] } = query.data;
   const editable = can("write") && !workspace?.archived_at;
+  const withCurrentName = (account: Account) => ({
+    ...account,
+    name: accounts.find(item => item.id === account.id)?.name ?? account.name,
+  });
   const editChannel = (account: Account) => {
     if (account.platform === "weixin") setPairing(account);
     else setAction({ kind: "edit", account });
@@ -596,12 +678,13 @@ function Channels({ nav }: { nav: React.ReactNode }) {
           </table>
         </div>
       )}
-      {editable && pairing && <PairingDialog account={pairing} text={text}
+      {editable && pairing && <PairingDialog account={withCurrentName(pairing)} text={text}
         dismiss={() => setPairing(null)} requestDelete={setDeleting} />}
-      {editable && action && <AccountDialog key={action.kind} action={action} text={text}
+      {editable && action && <AccountDialog key={action.kind}
+        action={action.kind === "edit" ? { ...action, account: withCurrentName(action.account) } : action} text={text}
         dismiss={() => setAction(null)} pair={setPairing} requestDelete={setDeleting}
         qqScanAvailable={qq_scan_available} connectors={connectors} />}
-      {editable && deleting && <DeleteChannelDialog account={deleting} text={text}
+      {editable && deleting && <DeleteChannelDialog account={withCurrentName(deleting)} text={text}
         dismiss={() => setDeleting(null)} onDeleted={finishDelete} />}
     </Page>
   );

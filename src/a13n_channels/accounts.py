@@ -143,6 +143,29 @@ class Accounts:
         with self.transaction() as db:
             return db.execute(sql, args).fetchall()
 
+    async def rename(self, workspace_id: str, channel_id: str, name: str) -> bool:
+        def update() -> bool:
+            with self.transaction() as db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute(
+                    "SELECT platform FROM channel_accounts WHERE workspace_id = ? AND id = ?",
+                    (workspace_id, channel_id),
+                ).fetchone()
+                if row is None:
+                    return False
+                table = {
+                    "qq": "qq_accounts",
+                    "weixin": "weixin_accounts",
+                    "github": "github_accounts",
+                    "github_app": "github_accounts",
+                }.get(row["platform"], "connector_accounts")
+                db.execute(
+                    f"UPDATE {table} SET name = ? WHERE workspace_id = ? AND id = ?", (name, workspace_id, channel_id)
+                )
+                return True
+
+        return await asyncio.to_thread(update)
+
     async def routes(self, workspace_id: str) -> list[Route]:
         def load() -> list[Route]:
             with self.transaction() as db:
