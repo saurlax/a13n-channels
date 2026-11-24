@@ -9,12 +9,49 @@ from a13n_channels.channels import mqtt
 from a13n_channels.channels.adapter import ChannelError
 
 CONFIG = {
-    "host": "broker.example.com",
-    "username": "bot",
-    "password": "password",
+    "broker_url": "mqtts://bot:password@broker.example.com",
     "topic_filter": "events/#",
     "reply_topic": "results",
 }
+
+
+def test_broker_url_round_trips_existing_credentials_and_decodes_userinfo():
+    previous = {
+        "host": "broker.example.com",
+        "port": "8884",
+        "username": "test@example.com",
+        "password": "p:ss#%word",
+        "topic_filter": CONFIG["topic_filter"],
+        "reply_topic": CONFIG["reply_topic"],
+    }
+    migrated = mqtt.migrate_config(previous)
+    assert migrated == {
+        **CONFIG,
+        "broker_url": "mqtts://test%40example.com:p%3Ass%23%25word@broker.example.com:8884",
+    }
+    parsed = mqtt.Broker.from_config(migrated)
+    assert parsed == mqtt.Broker.from_config(previous)
+    assert (parsed.host, parsed.port, parsed.username, parsed.password) == (
+        "broker.example.com",
+        8884,
+        "test@example.com",
+        "p:ss#%word",
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "mqtt://bot:password@broker.example.com",
+        "mqtts://bot:password@broker.example.com:0",
+        "mqtts://bot:password@broker.example.com/path",
+        "mqtts://bot:password@broker.example.com?topic=wrong",
+        "mqtts://bot:pass%word@broker.example.com",
+    ],
+)
+def test_rejects_unsupported_broker_urls(url):
+    with pytest.raises(ChannelError, match="broker URL"):
+        mqtt.Broker.from_config({**CONFIG, "broker_url": url})
 
 
 class Writer:
@@ -35,12 +72,16 @@ class Writer:
         pass
 
 
-def test_rejects_a_reply_topic_inside_the_subscription():
+def test_allows_a_reply_topic_inside_the_subscription():
     for topic_filter, reply_topic in (("events/#", "events"), ("events/+", "events/reply"), ("#", "results")):
-        with pytest.raises(ChannelError, match="outside"):
-            mqtt.Broker.from_config({**CONFIG, "topic_filter": topic_filter, "reply_topic": reply_topic})
-    assert not mqtt._matches("#", "$SYS/broker")
-    assert mqtt._matches("events/+", "events/")
+        assert (
+            mqtt.Broker.from_config({**CONFIG, "topic_filter": topic_filter, "reply_topic": reply_topic}).reply_topic
+            == reply_topic
+        )
+    assert not mqtt.matches_topic("#", "$SYS/broker")
+    assert mqtt.matches_topic("events/+", "events/")
+    with pytest.raises(ChannelError, match="valid MQTT reply topic"):
+        mqtt.Broker.from_config({**CONFIG, "reply_topic": "events/+"})
 
 
 @pytest.mark.parametrize("untrusted_ip", ["127.0.0.1", "169.254.169.254", "10.0.0.1", "64:ff9b::7f00:1"])
@@ -92,7 +133,7 @@ def test_normalizes_text_and_deduplicates_only_stable_application_ids():
     assert mqtt._channel_message("channel", "events/topic", b"\xff") is None
 
 
-def test_subscribes_and_acknowledges_only_after_ingest(monkeypatch):
+def test_subscribes_to_route_filters_and_acknowledges_only_after_ingest(monkeypatch):
     async def run():
         reader = asyncio.StreamReader()
         writer = Writer()
@@ -107,7 +148,7 @@ def test_subscribes_and_acknowledges_only_after_ingest(monkeypatch):
         reader.feed_data(
             b"\x20\x02\x00\x00"
             + mqtt._packet(0x32, publish + incoming_id + b"hello")
-            + b"\x90\x03\x00\x01\x01"
+            + b"\x90\x04\x00\x01\x01\x00"
             + mqtt._packet(0x33, publish + retained_id + b"retained")
         )
         received = []
@@ -121,12 +162,15 @@ def test_subscribes_and_acknowledges_only_after_ingest(monkeypatch):
             if state == "connected":
                 connected.set()
 
-        connector = mqtt.ADAPTER.connect(None, "channel", "account", CONFIG)
+        connector = mqtt.ADAPTER.connect(None, "channel", "account", {"broker_url": CONFIG["broker_url"]})
+        connector.subscriptions = connector.subscription_filters({"events/#", "other/+"})
         task = asyncio.create_task(connector.listen("", ingest, status))
         try:
             await asyncio.wait_for(connected.wait(), 1)
             assert writer.frames[0][0] == 0x10
-            assert writer.frames[1] == mqtt._packet(0x82, b"\x00\x01" + mqtt._field("events/#") + b"\x01")
+            assert writer.frames[1] == mqtt._packet(
+                0x82, b"\x00\x01" + mqtt._field("events/#") + b"\x01" + mqtt._field("other/+") + b"\x01"
+            )
             assert writer.frames[2:] == [b"\x40\x02\x00\x11", b"\x40\x02\x00\x12"]
             assert [message.text for message in received] == ["hello"]
         finally:
@@ -139,7 +183,8 @@ def test_subscribes_and_acknowledges_only_after_ingest(monkeypatch):
 
 
 @pytest.mark.parametrize("ack", [b"\x40\x02\x00\x01", b"\x40\x02\x00\x02", b""])
-def test_sends_to_fixed_reply_topic_and_requires_matching_puback(monkeypatch, ack):
+@pytest.mark.parametrize("reply_topic,legacy_topic", [(None, ""), ("events/override", "results"), (None, "results")])
+def test_reply_destination_puback_and_echo_suppression(monkeypatch, ack, reply_topic, legacy_topic):
     async def run():
         reader = asyncio.StreamReader()
         writer = Writer()
@@ -150,20 +195,22 @@ def test_sends_to_fixed_reply_topic_and_requires_matching_puback(monkeypatch, ac
             return reader, writer
 
         monkeypatch.setattr(mqtt, "_dial", dial)
-        connector = mqtt.ADAPTER.connect(None, "channel", "account", CONFIG)
+        config = {**CONFIG, "reply_topic": legacy_topic}
+        connector = mqtt.ADAPTER.connect(None, "channel", "account", config)
         message, context = mqtt._channel_message("channel", "events/topic", b'{"message_id":"req-1"}')
         if ack == b"\x40\x02\x00\x01":
-            sent_id = await connector.reply(message, "world", context)
+            sent_id = await connector.reply(message, "world", context, reply_topic=reply_topic)
         else:
             with pytest.raises(ChannelError, match="confirm"):
-                await connector.reply(message, "world", context)
+                await connector.reply(message, "world", context, reply_topic=reply_topic)
             sent_id = None
 
         frame = asyncio.StreamReader()
         frame.feed_data(writer.frames[1])
         header, body = await mqtt._read_packet(frame)
         assert header == 0x32
-        prefix = mqtt._field("results") + b"\x00\x01"
+        topic = reply_topic or legacy_topic or "events/topic"
+        prefix = mqtt._field(topic) + b"\x00\x01"
         assert body.startswith(prefix)
         payload = json.loads(body[len(prefix) :])
         assert payload == {
@@ -172,6 +219,20 @@ def test_sends_to_fixed_reply_topic_and_requires_matching_puback(monkeypatch, ac
             "in_reply_to": "req-1",
             "text": "world",
         }
+        # A fresh listener acknowledges the echo without storing it or waking an agent.
+        receiver = mqtt.ADAPTER.connect(None, "other-channel", "account", config)
+        receiver.subscriptions = ("#",)
+        received = []
+
+        async def ingest(message, *, context):
+            received.append(message.text)
+
+        echo = Writer()
+        await receiver._publish_received(echo, ingest, header, body)
+        assert received == []
+        assert echo.frames == [b"\x40\x02\x00\x01"]
+        await receiver._publish_received(echo, ingest, 0x32, prefix + b'{"in_reply_to":"req-1","text":"external"}')
+        assert len(received) == 1
         assert writer.closed
 
     asyncio.run(run())

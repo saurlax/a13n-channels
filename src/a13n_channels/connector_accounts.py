@@ -48,6 +48,8 @@ async def save_account(
             raise not_found("channel", channel_id)
         previous = rows[0]
         config = runtime.store.connector_credentials(previous)
+        if adapter.migrate_config is not None:
+            config = adapter.migrate_config(config)
     else:
         channel_id = new_object_id("ch")
         if not body.name or not body.name.strip():

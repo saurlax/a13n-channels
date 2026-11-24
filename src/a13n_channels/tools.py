@@ -630,7 +630,11 @@ class ChannelTools(AbstractHarnessPlugin):
             )
             raise
         try:
-            if rich is None and reference_id is None:
+            if account["platform"] == "mqtt" and job["mqtt_reply_topic"]:
+                sent = await active.send_reply(
+                    account, job["message_id"], text, mqtt_reply_topic=job["mqtt_reply_topic"]
+                )
+            elif rich is None and reference_id is None:
                 sent = await active.send_reply(account, job["message_id"], text)
             else:
                 sent = await active.send_reply(

@@ -77,6 +77,8 @@ class Accounts:
                     db.execute("ALTER TABLE channel_deliveries ADD COLUMN destination TEXT NOT NULL DEFAULT ''")
                     db.execute("""UPDATE channel_deliveries SET destination =
                         json_array('conversation', channel_id, account_id, kind, conversation_id)""")
+                if not any(row[1] == "mqtt_reply_topic" for row in db.execute("PRAGMA table_info(channel_deliveries)")):
+                    db.execute("ALTER TABLE channel_deliveries ADD COLUMN mqtt_reply_topic TEXT")
                 if not any(row[1] == "tool_key" for row in db.execute("PRAGMA table_info(channel_deliveries)")):
                     db.execute("ALTER TABLE channel_deliveries ADD COLUMN tool_key TEXT")
                     db.execute("ALTER TABLE channel_deliveries ADD COLUMN tool_request TEXT")
@@ -173,6 +175,21 @@ class Accounts:
 
         return await asyncio.to_thread(load)
 
+    async def mqtt_subscriptions(self, workspace_ids: set[str]) -> dict[str, set[str]]:
+        def load() -> dict[str, set[str]]:
+            subscriptions: dict[str, set[str]] = {}
+            with self.transaction() as db:
+                for workspace_id in workspace_ids:
+                    for route in read_routes(db, workspace_id):
+                        if not route.enabled or not route.principal_id:
+                            continue
+                        for source in route.sources:
+                            if source.kind == "topic" and source.channel_id != "*" and source.conversation_id != "*":
+                                subscriptions.setdefault(source.channel_id, set()).add(source.conversation_id)
+            return subscriptions
+
+        return await asyncio.to_thread(load)
+
     async def save_route(
         self, workspace_id: str, route_id: str, body: RouteInput, *, principal_id: str, create: bool
     ) -> Route:
@@ -208,11 +225,24 @@ class Accounts:
                     if channel_id in body.allowed_users:
                         raise ServiceError("invalid_argument", "Choose an account for each allowed user.")
                     continue
-                if not db.execute(
-                    "SELECT id FROM channel_accounts WHERE id = ? AND workspace_id = ?",
+                account = db.execute(
+                    "SELECT * FROM channel_accounts WHERE id = ? AND workspace_id = ?",
                     (channel_id, workspace_id),
-                ).fetchone():
+                ).fetchone()
+                if not account:
                     raise ServiceError("invalid_argument", "Choose a channel in this workspace.")
+                if (
+                    body.enabled
+                    and account["platform"] == "mqtt"
+                    and any(
+                        source.channel_id == channel_id and (source.kind != "topic" or source.conversation_id == "*")
+                        for source in body.sources
+                    )
+                    and not self.connector_credentials(account).get("topic_filter")
+                ):
+                    raise ServiceError(
+                        "invalid_argument", "Enter an MQTT subscription filter in Sources.", {"field": "mqtt_source"}
+                    )
             if any(source.repository and source.channel_id not in github_channels for source in body.sources):
                 raise ServiceError("invalid_argument", "Choose a GitHub channel for a repository source.")
             destination_changed = previous is not None and (
@@ -260,6 +290,7 @@ class Accounts:
                             "multiparty_messages",
                             "wake_agent_id",
                             "allowed_users",
+                            "mqtt_reply_topic",
                         }
                     ),
                     binding_id,

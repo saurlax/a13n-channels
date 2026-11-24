@@ -29,7 +29,7 @@ const english = {
   wakeAgent: "Wake Agent", noWakeAgent: "None",
   wakeHelp: "Decides whether matching messages reach the target Agent. Configure the criteria in the wake Agent’s instructions.",
   wakeError: "Choose a different published Agent in this workspace.",
-  issue: "Issue", pullRequest: "Pull Request", channelKind: "Channel", thread: "Thread", topic: "MQTT topic", allKinds: "All conversation types",
+  issue: "Issue", pullRequest: "Pull Request", channelKind: "Channel", thread: "Thread", topic: "MQTT topic", topicFilter: "MQTT subscription filter", mqttReply: "MQTT reply topic", mqttSourceTopic: "Default reply topic", mqttSourceError: "Enter an MQTT subscription filter in Sources.", allKinds: "All conversation types",
   cancel: "Cancel", save: "Save", remove: "Delete", deleteTitle: "Delete route",
   deleteError: "The route could not be deleted. Try again.",
   deleteBody: "New messages will stop using this route. Existing Console conversations are retained.",
@@ -76,7 +76,7 @@ const chinese: typeof english = {
   wakeAgent: "唤醒 Agent", noWakeAgent: "不使用",
   wakeHelp: "决定匹配的消息是否交给目标 Agent。判断条件写在唤醒 Agent 的指令里。",
   wakeError: "请选择当前工作区内另一个已发布的 Agent。",
-  issue: "Issue", pullRequest: "Pull Request", channelKind: "频道", thread: "话题", topic: "MQTT 主题", allKinds: "全部会话类型",
+  issue: "Issue", pullRequest: "Pull Request", channelKind: "频道", thread: "话题", topic: "MQTT 主题", topicFilter: "MQTT 接收主题", mqttReply: "MQTT 回复主题", mqttSourceTopic: "按默认设置回复", mqttSourceError: "请在「来源」中填写 MQTT 接收主题。", allKinds: "全部会话类型",
   cancel: "取消", save: "保存", remove: "删除", deleteTitle: "删除路由",
   deleteError: "未能删除路由，请重试。",
   deleteBody: "新消息将不再使用这条路由。已有的 Console 会话会保留。",
@@ -111,6 +111,7 @@ type RouteInput = {
   context_idle_seconds: number;
   multiparty_messages: MultipartyFilter | null; wake_agent_id: string | null;
   allowed_users: Record<string, string[]>;
+  mqtt_reply_topic?: string | null;
 };
 type Route = RouteInput & { id: string; needs_authorization: boolean };
 type RouteList = { configured: boolean; routes: Route[] };
@@ -194,9 +195,10 @@ function SourceEditor({ source, accounts, update, remove, text, disabled }: {
   const optionsId = React.useId();
   const account = accounts.find(item => item.id === source.channel_id);
   const github = isGitHub(account);
+  const mqtt = account?.platform === "mqtt";
   const supported = ["*", ...(account?.conversation_kinds ?? [])];
   const kind = account ? source.kind : "*";
-  const conversationLabel = github ? text.repository : text.conversationId;
+  const conversationLabel = github ? text.repository : mqtt ? text.topicFilter : text.conversationId;
   function addConversation() {
     const value = source.input.trim();
     if (value === "*" || (github && value && !validRepo(value))) return;
@@ -221,7 +223,9 @@ function SourceEditor({ source, accounts, update, remove, text, disabled }: {
             ...(source.channel_id && source.channel_id !== "*" && !account
               ? [{ value: source.channel_id, label: `${text.missing} (${source.channel_id})` }] : []),
           ]}
-          onChange={id => update({ ...sourceDefaults(), channel_id: id })} />
+          onChange={id => update({
+            ...sourceDefaults(), channel_id: id, kind: accounts.find(item => item.id === id)?.platform === "mqtt" ? "topic" : "*",
+          })} />
       </td>
       <td>
         <ChannelSelect label={text.kind} disabled={disabled || !account} value={kind}
@@ -245,7 +249,7 @@ function SourceEditor({ source, accounts, update, remove, text, disabled }: {
               </span>
             ))}
             <Input unstyled aria-label={conversationLabel} disabled={disabled} list={github ? undefined : optionsId}
-              placeholder={github ? "owner/repo" : source.conversations.length ? conversationLabel : text.conversationPlaceholder}
+              placeholder={github ? "owner/repo" : mqtt ? "devices/+/alerts" : source.conversations.length ? conversationLabel : text.conversationPlaceholder}
               value={source.input} maxLength={github ? 150 : 512}
               pattern={github ? repoPattern : String.raw`(?!\s*\*\s*$).*`}
               onChange={event => update({ ...source, input: event.currentTarget.value })}
@@ -351,6 +355,9 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
   const [allowedUsers, setAllowedUsers] = React.useState<UserDraft[]>(() =>
     Object.entries(route?.allowed_users ?? {}).map(([channelId, users], id) => ({ id, channelId, users: users.join(", ") })),
   );
+  const [mqttReplyTopic, setMQTTReplyTopic] = React.useState(route?.mqtt_reply_topic ?? "");
+  const hasMQTTSource = sources.some(({ value }) => value.channel_id === "*" ||
+    accounts.some(account => account.id === value.channel_id && account.platform === "mqtt"));
   const nextUser = React.useRef(allowedUsers.length);
   const nextSource = React.useRef(sources.length);
   const [confirming, setConfirming] = React.useState<RouteAction | null>(null);
@@ -418,6 +425,7 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
         body: JSON.stringify({
           name, agent_id: agent, enabled,
           sources: savedSources, allowed_users: Object.fromEntries(usersByAccount),
+          mqtt_reply_topic: hasMQTTSource ? mqttReplyTopic.trim() || null : null,
           multiparty_messages: multiparty === "legacy" ? null : multiparty, wake_agent_id: wakeAgent || null,
           thread_policy: policy, fixed_thread_id: policy === "fixed" ? threadId.trim() || null : null,
           context_idle_seconds: managesContext ? Number(contextIdle) : route?.context_idle_seconds ?? 3600,
@@ -427,6 +435,8 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
     } catch (error) {
       if (error instanceof ApiError && error.details.reason === "thread_destination_busy") {
         setError(text.busyThread);
+      } else if (error instanceof ApiError && error.details.field === "mqtt_source") {
+        setError(text.mqttSourceError);
       } else if (error instanceof ApiError && error.details.field === "repository") {
         setError(text.githubError);
       } else if (error instanceof ApiError && error.details.field === "allowed_users") {
@@ -498,6 +508,10 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
               </tbody>
             </table>
           </div>
+          {hasMQTTSource && <div className="a13n-route-settings"><label>{text.mqttReply}
+            <Input disabled={disabled} value={mqttReplyTopic} maxLength={512} pattern={String.raw`(?!\s*\*\s*$)[^+#]*`}
+              placeholder={text.mqttSourceTopic} onChange={event => setMQTTReplyTopic(event.currentTarget.value)} />
+          </label></div>}
         </section>
         <section className="a13n-route-sources" aria-label={text.filters}>
           <div className="a13n-route-section-header"><h2>{text.filters}</h2></div>

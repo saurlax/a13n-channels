@@ -34,6 +34,7 @@ from websockets.exceptions import WebSocketException
 from a13n_channels.accounts import Accounts
 from a13n_channels.channels.adapter import ChannelError, Connection
 from a13n_channels.channels.github import GITHUB_KINDS, GitHubBind, GitHubConnection, GitHubPlatform, stamp
+from a13n_channels.channels.mqtt import MQTTConnection
 from a13n_channels.channels.qq import (
     QQ_CONVERSATION_KINDS,
     AppId,
@@ -53,6 +54,7 @@ from a13n_channels.channels.weixin import (
     Pairing,
     PairingPoll,
     PairingResult,
+    PairingSave,
     WeixinConnection,
     WeixinCreate,
     poll_pairing,
@@ -122,7 +124,7 @@ class ChannelsRuntime:
         self.connectors: dict[str, tuple[str, Connection]] = {}
         self.status: dict[str, str] = {}
         self.changed = asyncio.Event()
-        self.pairings: dict[str, Pairing] = {}
+        self.pairings: dict[str | tuple[str, str, str], Pairing] = {}
         self.qq_scans = QQScans()
         self.qq_probes: set[str] = set()
         settings = runtime.settings.extensions.get(SETTINGS, ChannelsSettings())
@@ -161,12 +163,21 @@ class ChannelsRuntime:
                     desired = await self._enabled_accounts()
                 except SQLAlchemyError:
                     desired = {}
+                mqtt_workspaces = {row["workspace_id"] for row in desired.values() if row["platform"] == "mqtt"}
+                subscriptions = await self.store.mqtt_subscriptions(mqtt_workspaces) if mqtt_workspaces else {}
                 for channel_id, (generation, task) in list(self.members.items()):
                     row = desired.get(channel_id)
+                    member = self.connectors.get(channel_id)
+                    connection = member[1] if member else None
+                    mqtt_filters_changed = isinstance(connection, MQTTConnection) and (
+                        connection.subscriptions
+                        != connection.subscription_filters(subscriptions.get(channel_id, set()))
+                    )
                     if (
                         row is None
                         or generation != row["generation"]
-                        or (task.done() and self.status.get(channel_id) != "login_required")
+                        or mqtt_filters_changed
+                        or (task.done() and self.status.get(channel_id) not in {"login_required", "inactive"})
                     ):
                         task.cancel()
                         await asyncio.gather(task, return_exceptions=True)
@@ -176,7 +187,7 @@ class ChannelsRuntime:
                 for channel_id, row in desired.items():
                     if channel_id not in self.members:
                         try:
-                            task = self._listen(row)
+                            task = self._listen(row, subscriptions.get(channel_id, set()))
                         except (ServiceError, ChannelError):
                             self.status[channel_id] = "error"
                             continue
@@ -195,7 +206,7 @@ class ChannelsRuntime:
             await asyncio.gather(*tasks, return_exceptions=True)
             self.connectors.clear()
 
-    def _listen(self, row: sqlite3.Row) -> asyncio.Task:
+    def _listen(self, row: sqlite3.Row, subscriptions: set[str] | None = None) -> asyncio.Task:
         channel_id = row["id"]
 
         def status(state: str) -> None:
@@ -218,6 +229,8 @@ class ChannelsRuntime:
         elif row["platform"] in ADAPTERS:
             adapter = ADAPTERS[row["platform"]]
             connection = adapter.connect(self.http, channel_id, row["app_id"], self.store.connector_credentials(row))
+            if isinstance(connection, MQTTConnection):
+                connection.subscriptions = connection.subscription_filters(subscriptions or set())
 
             async def ingest_connector(
                 message: ChannelMessage | None, *, cursor: str | None = None, context: dict[str, str] | None = None
@@ -250,6 +263,7 @@ class ChannelsRuntime:
         rich: QQRichContent | None = None,
         data: bytes | None = None,
         reference_id: str | None = None,
+        mqtt_reply_topic: str | None = None,
     ) -> str:
         channel_id = account["id"]
         if account["platform"] == "qq":
@@ -331,7 +345,11 @@ class ChannelsRuntime:
                 else {}
             )
             try:
-                return await member[1].reply(ChannelMessage.model_validate_json(rows[0]["payload"]), text, context)
+                connection = member[1]
+                message = ChannelMessage.model_validate_json(rows[0]["payload"])
+                if isinstance(connection, MQTTConnection):
+                    return await connection.reply(message, text, context, reply_topic=mqtt_reply_topic)
+                return await connection.reply(message, text, context)
             except ChannelError as error:
                 raise ServiceError("unavailable" if error.retryable else "invalid_argument", str(error)) from None
             except (httpx.HTTPError, OSError, TimeoutError, ValueError, KeyError, TypeError, WebSocketException):
@@ -633,6 +651,7 @@ def definition() -> AppDefinition:
                     "invalid_argument", "Choose an active conversation Thread.", {"field": "fixed_thread_id"}
                 )
         route = await active.store.save_route(scope.workspace_id, route_id, body, principal_id=actor.id, create=create)
+        active.changed.set()
         return route.model_dump(exclude={"binding_id", "principal_id"})
 
     @router.post("/routes", name="add_channel_route", status_code=201)
@@ -662,7 +681,9 @@ def definition() -> AppDefinition:
         route_id: ChannelId, runtime: CurrentRuntime, actor: Actor, workspace_id: WorkspaceId
     ) -> None:
         scope = await writable_scope(runtime, actor, workspace_id)
-        await require_channels().store.delete_route(scope.workspace_id, route_id)
+        active = require_channels()
+        await active.store.delete_route(scope.workspace_id, route_id)
+        active.changed.set()
 
     async def save_github(platform, body, runtime, actor, workspace_id, channel_id=None):
         scope = await writable_scope(runtime, actor, workspace_id)
@@ -1046,23 +1067,37 @@ def definition() -> AppDefinition:
         )
         return active.channel_view(rows[0])
 
+    @router.post("/weixin/pair", name="start_new_weixin_pairing")
+    async def begin_new_weixin(runtime: CurrentRuntime, actor: Actor, workspace_id: WorkspaceId) -> PairingResult:
+        return await begin_weixin(None, runtime, actor, workspace_id)
+
     @router.post("/weixin/accounts/{channel_id}/pair", name="start_weixin_pairing")
     async def begin_weixin(
-        channel_id: ChannelId, runtime: CurrentRuntime, actor: Actor, workspace_id: WorkspaceId
+        channel_id: ChannelId | None, runtime: CurrentRuntime, actor: Actor, workspace_id: WorkspaceId
     ) -> PairingResult:
         await writable_scope(runtime, actor, workspace_id)
         active = require_channels()
-        row = await weixin_account(active, channel_id, workspace_id)
+        expected = None
+        if channel_id is not None:
+            row = await weixin_account(active, channel_id, workspace_id)
+            expected = row["credentials"]
         try:
-            login, result = await start_pairing(active.http, row["credentials"])
+            login, result = await start_pairing(active.http, expected)
         except (httpx.HTTPError, ValueError, KeyError, TypeError):
             raise ServiceError("unavailable", "Weixin could not start QR pairing.") from None
-        active.pairings[channel_id] = login
+        key = channel_id or (workspace_id, actor.id, login.login_id)
+        active.pairings[key] = login
         return result
+
+    @router.post("/weixin/pair/status", name="poll_new_weixin_pairing")
+    async def check_weixin_new(
+        body: PairingPoll, runtime: CurrentRuntime, actor: Actor, workspace_id: WorkspaceId
+    ) -> PairingResult:
+        return await check_weixin(None, body, runtime, actor, workspace_id)
 
     @router.post("/weixin/accounts/{channel_id}/pair/status", name="poll_weixin_pairing")
     async def check_weixin(
-        channel_id: ChannelId,
+        channel_id: ChannelId | None,
         body: PairingPoll,
         runtime: CurrentRuntime,
         actor: Actor,
@@ -1070,12 +1105,14 @@ def definition() -> AppDefinition:
     ) -> PairingResult:
         await writable_scope(runtime, actor, workspace_id)
         active = require_channels()
-        await weixin_account(active, channel_id, workspace_id)
-        login = active.pairings.get(channel_id)
+        key = channel_id or (workspace_id, actor.id, body.login_id)
+        if channel_id is not None:
+            await weixin_account(active, channel_id, workspace_id)
+        login = active.pairings.get(key)
         if login is None or login.login_id != body.login_id:
             return PairingResult(status="expired")
         async with login.lock:
-            if active.pairings.get(channel_id) is not login or asyncio.get_running_loop().time() >= login.expires:
+            if active.pairings.get(key) is not login or asyncio.get_running_loop().time() >= login.expires:
                 return PairingResult(status="expired")
             if login.credentials is not None:
                 return PairingResult(status="confirmed")
@@ -1083,68 +1120,99 @@ def definition() -> AppDefinition:
                 result, credentials = await poll_pairing(active.http, login, body.verify_code)
             except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError):
                 raise ServiceError("unavailable", "Weixin could not check QR pairing.") from None
-            if active.pairings.get(channel_id) is not login or asyncio.get_running_loop().time() >= login.expires:
+            if active.pairings.get(key) is not login or asyncio.get_running_loop().time() >= login.expires:
                 return PairingResult(status="expired")
             if credentials is not None:
                 login.credentials = credentials
             elif result.status in {"expired", "verify_code_blocked", "binded_redirect"}:
-                active.pairings.pop(channel_id, None)
+                active.pairings.pop(key, None)
             return result
+
+    @router.post("/weixin/pair/save", name="save_new_weixin_pairing")
+    async def save_weixin_new(
+        body: PairingSave, runtime: CurrentRuntime, actor: Actor, workspace_id: WorkspaceId
+    ) -> PairingResult:
+        return await save_weixin(None, body, runtime, actor, workspace_id)
 
     @router.post("/weixin/accounts/{channel_id}/pair/save", name="save_weixin_pairing")
     async def save_weixin(
-        channel_id: ChannelId,
-        body: PairingPoll,
+        channel_id: ChannelId | None,
+        body: PairingSave,
         runtime: CurrentRuntime,
         actor: Actor,
         workspace_id: WorkspaceId,
     ) -> PairingResult:
         scope = await writable_scope(runtime, actor, workspace_id)
         active = require_channels()
-        await weixin_account(active, channel_id, workspace_id)
-        login = active.pairings.get(channel_id)
+        key = channel_id or (workspace_id, actor.id, body.login_id)
+        if channel_id is not None:
+            await weixin_account(active, channel_id, workspace_id)
+        login = active.pairings.get(key)
         if login is None or login.login_id != body.login_id:
             return PairingResult(status="expired")
         async with login.lock:
-            if active.pairings.get(channel_id) is not login or asyncio.get_running_loop().time() >= login.expires:
+            if active.pairings.get(key) is not login or asyncio.get_running_loop().time() >= login.expires:
                 return PairingResult(status="expired")
             credentials = login.credentials
             if credentials is None:
                 raise ServiceError("conflict", "Scan and authorize the Weixin bot before saving.")
+            name = body.name.strip() if body.name else ""
+            if channel_id is None and not name:
+                raise ServiceError("invalid_argument", "Enter a channel name.")
+            account_id = channel_id or new_object_id("wx")
             payload = credentials.model_dump(exclude={"token"})
             payload["token"] = credentials.token.get_secret_value()
             sealed = active.store.seal(
                 scope.organization_id,
                 "channels.weixin_accounts",
                 "credentials",
-                channel_id,
+                account_id,
                 json.dumps(payload).encode(),
             )
             try:
-                updated = await active.store.query(
-                    """UPDATE weixin_accounts SET cursor = CASE WHEN bot_id = ? THEN cursor ELSE '' END,
-                           bot_id = ?, credentials = ?
-                       WHERE id = ? AND workspace_id = ? AND credentials IS ? RETURNING id""",
-                    credentials.bot_id,
-                    credentials.bot_id,
-                    sealed,
-                    channel_id,
-                    workspace_id,
-                    login.expected,
-                )
+                if channel_id is None:
+                    updated = await active.store.query(
+                        """INSERT INTO weixin_accounts (id, organization_id, workspace_id, name, bot_id, credentials)
+                           VALUES (?, ?, ?, ?, ?, ?) RETURNING id""",
+                        account_id,
+                        scope.organization_id,
+                        workspace_id,
+                        name,
+                        credentials.bot_id,
+                        sealed,
+                    )
+                else:
+                    updated = await active.store.query(
+                        """UPDATE weixin_accounts SET cursor = CASE WHEN bot_id = ? THEN cursor ELSE '' END,
+                               bot_id = ?, credentials = ?
+                           WHERE id = ? AND workspace_id = ? AND credentials IS ? RETURNING id""",
+                        credentials.bot_id,
+                        credentials.bot_id,
+                        sealed,
+                        channel_id,
+                        workspace_id,
+                        login.expected,
+                    )
             except sqlite3.IntegrityError:
-                active.pairings.pop(channel_id, None)
+                if active.pairings.get(key) is login:
+                    active.pairings.pop(key)
                 raise ServiceError("conflict", "This Weixin bot is already registered.") from None
-            if active.pairings.get(channel_id) is login:
-                active.pairings.pop(channel_id)
+            if active.pairings.get(key) is login:
+                active.pairings.pop(key)
             if not updated:
                 raise ServiceError("conflict", "The channel changed. Start pairing again.")
             active.changed.set()
             return PairingResult(status="confirmed")
 
+    @router.delete("/weixin/pair/{login_id}", name="cancel_new_weixin_pairing", status_code=204)
+    async def cancel_new_weixin(
+        login_id: str, runtime: CurrentRuntime, actor: Actor, workspace_id: WorkspaceId
+    ) -> None:
+        await cancel_weixin(None, login_id, runtime, actor, workspace_id)
+
     @router.delete("/weixin/accounts/{channel_id}/pair/{login_id}", name="cancel_weixin_pairing", status_code=204)
     async def cancel_weixin(
-        channel_id: ChannelId,
+        channel_id: ChannelId | None,
         login_id: str,
         runtime: CurrentRuntime,
         actor: Actor,
@@ -1152,10 +1220,14 @@ def definition() -> AppDefinition:
     ) -> None:
         await writable_scope(runtime, actor, workspace_id)
         active = require_channels()
-        await weixin_account(active, channel_id, workspace_id)
-        login = active.pairings.get(channel_id)
+        key = channel_id or (workspace_id, actor.id, login_id)
+        if channel_id is not None:
+            await weixin_account(active, channel_id, workspace_id)
+        login = active.pairings.get(key)
         if login is not None and login.login_id == login_id:
-            active.pairings.pop(channel_id)
+            async with login.lock:
+                if active.pairings.get(key) is login:
+                    active.pairings.pop(key)
 
     @router.delete("/weixin/accounts/{channel_id}", name="delete_weixin_channel", status_code=204)
     async def delete_weixin(
