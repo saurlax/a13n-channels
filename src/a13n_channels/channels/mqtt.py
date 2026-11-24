@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from urllib.parse import quote, unquote, urlsplit
 from uuid import uuid4
 
 import httpx
@@ -25,6 +26,7 @@ _MAX_PAYLOAD = 64 * 1024
 _PACKET_ID = b"\x00\x01"
 _LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 _MESSAGE_ID = re.compile(r"[a-zA-Z0-9_.:-]{1,128}")
+_REPLY_ID = re.compile(r"a13n-reply-[0-9a-f]{32}")
 _NAT64 = ipaddress.IPv6Network("64:ff9b::/96")
 
 
@@ -34,7 +36,19 @@ def _valid_topic(topic: str) -> bool:
     )
 
 
-def _matches(topic_filter: str, topic: str) -> bool:
+def valid_publish_topic(topic: str) -> bool:
+    return _valid_topic(topic) and not any(wildcard in topic for wildcard in "+#")
+
+
+def valid_subscription_filter(topic_filter: str) -> bool:
+    levels = topic_filter.split("/")
+    return _valid_topic(topic_filter) and all(
+        ("+" not in level or level == "+") and ("#" not in level or (level == "#" and i == len(levels) - 1))
+        for i, level in enumerate(levels)
+    )
+
+
+def matches_topic(topic_filter: str, topic: str) -> bool:
     if topic.startswith("$") and topic_filter.startswith(("#", "+")):
         return False
     levels = topic.split("/")
@@ -44,6 +58,19 @@ def _matches(topic_filter: str, topic: str) -> bool:
         if index >= len(levels) or pattern not in {"+", levels[index]}:
             return False
     return len(levels) == topic_filter.count("/") + 1
+
+
+def migrate_config(config: Configuration) -> dict[str, str]:
+    if "host" not in config:
+        return dict(config)
+    host = config["host"]
+    port = config.get("port", "").strip()
+    username = quote(config.get("username", ""), safe="")
+    password = quote(config.get("password", ""), safe="")
+    migrated = {key: value for key, value in config.items() if key not in {"host", "port", "username", "password"}}
+    address = f"{host}:{port}" if port else host
+    migrated.setdefault("broker_url", f"mqtts://{username}:{password}@{address}")
+    return migrated
 
 
 @dataclass(frozen=True, repr=False)
@@ -57,7 +84,29 @@ class Broker:
 
     @classmethod
     def from_config(cls, config: Configuration) -> "Broker":
-        hostname = config.get("host", "").strip().rstrip(".")
+        address = migrate_config(config).get("broker_url", "")
+        try:
+            parsed = urlsplit(address)
+            if (
+                any(char.isspace() or ord(char) < 32 or char == "\\" for char in address)
+                or parsed.scheme != "mqtts"
+                or not parsed.hostname
+                or parsed.netloc.count("@") != 1
+                or parsed.path not in {"", "/"}
+                or parsed.query
+                or parsed.fragment
+                or re.search(r"%(?![a-fA-F0-9]{2})", parsed.netloc)
+            ):
+                raise ValueError
+            port = 8883 if parsed.port is None else parsed.port
+            if port < 1:
+                raise ValueError
+            username = unquote(parsed.username or "", errors="strict")
+            password = unquote(parsed.password or "", errors="strict")
+        except ValueError:
+            raise ChannelError("Enter a valid mqtts://username:password@host:port broker URL.") from None
+
+        hostname = parsed.hostname.rstrip(".")
         try:
             host = hostname.encode("idna").decode("ascii").lower()
         except UnicodeError:
@@ -66,27 +115,16 @@ class Broker:
         if len(host) > 253 or len(labels) < 2 or labels[-1].isdigit() or not all(_LABEL.fullmatch(x) for x in labels):
             raise ChannelError("Enter a public MQTT broker hostname.")
 
-        port_text = config.get("port", "").strip() or "8883"
-        if not re.fullmatch(r"[0-9]{1,5}", port_text) or not 1 <= int(port_text) <= 65535:
-            raise ChannelError("Enter a valid MQTT TLS port.")
-        username = config.get("username", "")
-        password = config.get("password", "")
         if not username or not password or "\0" in username or len(username) > 512 or len(password) > 2048:
-            raise ChannelError("Enter the MQTT username and password.")
+            raise ChannelError("Include the MQTT username and password in the broker URL.")
 
         topic_filter = config.get("topic_filter", "").strip()
         reply_topic = config.get("reply_topic", "").strip()
-        levels = topic_filter.split("/")
-        if not _valid_topic(topic_filter) or any(
-            ("+" in level and level != "+") or ("#" in level and (level != "#" or i != len(levels) - 1))
-            for i, level in enumerate(levels)
-        ):
+        if topic_filter and not valid_subscription_filter(topic_filter):
             raise ChannelError("Enter a valid MQTT subscription filter.")
-        if not _valid_topic(reply_topic) or any(wildcard in reply_topic for wildcard in "+#"):
-            raise ChannelError("Enter a fixed MQTT reply topic.")
-        if _matches(topic_filter, reply_topic):
-            raise ChannelError("The MQTT reply topic must be outside the subscription filter.")
-        return cls(host, int(port_text), username, password, topic_filter, reply_topic)
+        if reply_topic and not valid_publish_topic(reply_topic):
+            raise ChannelError("Enter a valid MQTT reply topic.")
+        return cls(host, port, username, password, topic_filter, reply_topic)
 
 
 def _public_ip(address: str) -> bool:
@@ -192,7 +230,11 @@ async def bind(_http: httpx.AsyncClient, config: Configuration) -> str:
     async with _connection(broker):
         pass
     # Keep the account key stable across password changes and avoid returning credentials in that identifier.
-    address = json.dumps([broker.host, broker.port, broker.username, broker.topic_filter])
+    identity = [broker.host, broker.port, broker.username]
+    if broker.topic_filter:
+        # Preserve identities created when the subscription belonged to the account.
+        identity.append(broker.topic_filter)
+    address = json.dumps(identity)
     return hashlib.sha256(address.encode()).hexdigest()
 
 
@@ -233,6 +275,9 @@ def _channel_message(channel_id: str, topic: str, payload: bytes) -> tuple[Chann
             envelope = {}
         source_id = envelope.get("message_id")
         if isinstance(source_id, str) and _MESSAGE_ID.fullmatch(source_id):
+            # MQTT 3.1.1 can deliver our publications to any matching local subscription.
+            if _REPLY_ID.fullmatch(source_id) and isinstance(envelope.get("in_reply_to"), str):
+                return None
             message_id = hashlib.sha256(f"{topic}\0{source_id}".encode()).hexdigest()
             context["message_id"] = source_id
             content = envelope.get("text")
@@ -271,10 +316,14 @@ class MQTTConnection:
     def __init__(self, _http: httpx.AsyncClient, channel_id: str, _identity: str, config: Configuration):
         self.channel_id = channel_id
         self.broker = Broker.from_config(config)
+        self.subscriptions = self.subscription_filters(set())
+
+    def subscription_filters(self, route_filters: set[str]) -> tuple[str, ...]:
+        return tuple(sorted(route_filters | ({self.broker.topic_filter} if self.broker.topic_filter else set())))
 
     async def _publish_received(self, writer: asyncio.StreamWriter, ingest: Ingest, header: int, body: bytes) -> None:
         topic, payload, packet_id = _decode_publish(header, body)
-        if not header & 1 and _matches(self.broker.topic_filter, topic):
+        if not header & 1 and any(matches_topic(pattern, topic) for pattern in self.subscriptions):
             result = _channel_message(self.channel_id, topic, payload)
             if result is not None:
                 message, context = result
@@ -290,12 +339,13 @@ class MQTTConnection:
         status: Callable[[str], None],
         pong: asyncio.Event,
     ) -> None:
-        await _send(writer, 0x82, _PACKET_ID + _field(self.broker.topic_filter) + b"\x01")
+        filters = b"".join(_field(pattern) + b"\x01" for pattern in self.subscriptions)
+        await _send(writer, 0x82, _PACKET_ID + filters)
         async with asyncio.timeout(_IO_TIMEOUT):
             while True:
                 header, body = await _read_packet(reader)
-                if header == 0x90 and len(body) == 3 and body[:2] == _PACKET_ID:
-                    if body[2] not in {0, 1}:
+                if header == 0x90 and len(body) == 2 + len(self.subscriptions) and body[:2] == _PACKET_ID:
+                    if any(code not in {0, 1} for code in body[2:]):
                         raise ChannelError("The MQTT broker rejected the subscription.")
                     break
                 if header >> 4 != 3:
@@ -312,6 +362,9 @@ class MQTTConnection:
                 raise ChannelError("The MQTT broker sent an unexpected packet.", retryable=True)
 
     async def listen(self, _cursor: str, ingest: Ingest, status: Callable[[str], None]) -> None:
+        if not self.subscriptions:
+            status("inactive")
+            return
         delay = 1
         while True:
             started = asyncio.get_running_loop().time()
@@ -341,14 +394,19 @@ class MQTTConnection:
             await asyncio.sleep(delay)
             delay = min(delay * 2, 60)
 
-    async def reply(self, message: ChannelMessage, text: str, context: Mapping[str, str]) -> str:
+    async def reply(
+        self, message: ChannelMessage, text: str, context: Mapping[str, str], *, reply_topic: str | None = None
+    ) -> str:
         if (
             message.channel_id != self.channel_id
             or message.kind != "topic"
-            or not _matches(self.broker.topic_filter, message.conversation_id)
+            or not valid_publish_topic(message.conversation_id)
         ):
-            raise ChannelError("The MQTT message is outside this subscription.")
-        message_id = uuid4().hex
+            raise ChannelError("The MQTT reply is missing a valid source topic.")
+        topic = reply_topic or self.broker.reply_topic or message.conversation_id
+        if not valid_publish_topic(topic):
+            raise ChannelError("Enter a valid MQTT reply topic.")
+        message_id = f"a13n-reply-{uuid4().hex}"
         payload = json.dumps(
             {
                 "message_id": message_id,
@@ -360,7 +418,7 @@ class MQTTConnection:
         ).encode()
         async with _connection(self.broker) as (reader, writer):
             async with asyncio.timeout(_IO_TIMEOUT):
-                await _send(writer, 0x32, _field(self.broker.reply_topic) + _PACKET_ID + payload)
+                await _send(writer, 0x32, _field(topic) + _PACKET_ID + payload)
                 if await _read_packet(reader) != (0x40, _PACKET_ID):
                     raise ChannelError("The MQTT broker did not confirm the publication.", retryable=True)
         return message_id
@@ -371,14 +429,8 @@ ADAPTER = Adapter(
     label="MQTT",
     label_zh="MQTT",
     kinds=("topic",),
-    fields=(
-        CredentialField("host", "Public TLS broker hostname", "公网 TLS Broker 主机名", secret=False),
-        CredentialField("port", "TLS port (default 8883)", "TLS 端口（默认 8883）", secret=False, required=False),
-        CredentialField("username", "Broker username", "Broker 用户名"),
-        CredentialField("password", "Broker password", "Broker 密码"),
-        CredentialField("topic_filter", "Subscription filter", "订阅过滤器", secret=False),
-        CredentialField("reply_topic", "Reply topic", "回复主题", secret=False),
-    ),
+    fields=(CredentialField("broker_url", "Broker URL (mqtts://)", "Broker 连接 URL（mqtts://）"),),
     bind=bind,
     connect=MQTTConnection,
+    migrate_config=migrate_config,
 )

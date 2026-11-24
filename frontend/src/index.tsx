@@ -341,7 +341,8 @@ function AccountDialog({ action, text, dismiss, pair, requestDelete, qqScanAvail
           <label key={`${connector.key}:${field.key}`}>{text === chinese ? field.label_zh : field.label}
             <Input name={field.key} type={field.secret ? "password" : "text"}
               autoComplete={field.secret ? "new-password" : "off"} required={add && field.required}
-              placeholder={editing ? text.keepCurrent : undefined} maxLength={4096} disabled={pending} />
+              placeholder={editing ? text.keepCurrent : field.key === "broker_url" ? "mqtts://user:password@broker.example.com:8883" : undefined}
+              maxLength={4096} disabled={pending} />
           </label>
         ))}
         {githubFields && <>

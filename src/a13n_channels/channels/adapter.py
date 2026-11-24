@@ -57,3 +57,4 @@ class Adapter:
     fields: tuple[CredentialField, ...]
     bind: Callable[[httpx.AsyncClient, Configuration], Awaitable[str]]
     connect: Callable[[httpx.AsyncClient, str, str, Configuration], Connection]
+    migrate_config: Callable[[Configuration], dict[str, str]] | None = None

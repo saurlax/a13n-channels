@@ -34,6 +34,7 @@ from websockets.exceptions import WebSocketException
 from a13n_channels.accounts import Accounts
 from a13n_channels.channels.adapter import ChannelError, Connection
 from a13n_channels.channels.github import GITHUB_KINDS, GitHubBind, GitHubConnection, GitHubPlatform, stamp
+from a13n_channels.channels.mqtt import MQTTConnection
 from a13n_channels.channels.qq import (
     QQ_CONVERSATION_KINDS,
     AppId,
@@ -155,12 +156,21 @@ class ChannelsRuntime:
                     desired = await self._enabled_accounts()
                 except SQLAlchemyError:
                     desired = {}
+                mqtt_workspaces = {row["workspace_id"] for row in desired.values() if row["platform"] == "mqtt"}
+                subscriptions = await self.store.mqtt_subscriptions(mqtt_workspaces) if mqtt_workspaces else {}
                 for channel_id, (generation, task) in list(self.members.items()):
                     row = desired.get(channel_id)
+                    member = self.connectors.get(channel_id)
+                    connection = member[1] if member else None
+                    mqtt_filters_changed = isinstance(connection, MQTTConnection) and (
+                        connection.subscriptions
+                        != connection.subscription_filters(subscriptions.get(channel_id, set()))
+                    )
                     if (
                         row is None
                         or generation != row["generation"]
-                        or (task.done() and self.status.get(channel_id) != "login_required")
+                        or mqtt_filters_changed
+                        or (task.done() and self.status.get(channel_id) not in {"login_required", "inactive"})
                     ):
                         task.cancel()
                         await asyncio.gather(task, return_exceptions=True)
@@ -170,7 +180,7 @@ class ChannelsRuntime:
                 for channel_id, row in desired.items():
                     if channel_id not in self.members:
                         try:
-                            task = self._listen(row)
+                            task = self._listen(row, subscriptions.get(channel_id, set()))
                         except (ServiceError, ChannelError):
                             self.status[channel_id] = "error"
                             continue
@@ -189,7 +199,7 @@ class ChannelsRuntime:
             await asyncio.gather(*tasks, return_exceptions=True)
             self.connectors.clear()
 
-    def _listen(self, row: sqlite3.Row) -> asyncio.Task:
+    def _listen(self, row: sqlite3.Row, subscriptions: set[str] | None = None) -> asyncio.Task:
         channel_id = row["id"]
 
         def status(state: str) -> None:
@@ -212,6 +222,8 @@ class ChannelsRuntime:
         elif row["platform"] in ADAPTERS:
             adapter = ADAPTERS[row["platform"]]
             connection = adapter.connect(self.http, channel_id, row["app_id"], self.store.connector_credentials(row))
+            if isinstance(connection, MQTTConnection):
+                connection.subscriptions = connection.subscription_filters(subscriptions or set())
 
             async def ingest_connector(
                 message: ChannelMessage | None, *, cursor: str | None = None, context: dict[str, str] | None = None
@@ -244,6 +256,7 @@ class ChannelsRuntime:
         rich: QQRichContent | None = None,
         data: bytes | None = None,
         reference_id: str | None = None,
+        mqtt_reply_topic: str | None = None,
     ) -> str:
         channel_id = account["id"]
         if account["platform"] == "qq":
@@ -325,7 +338,11 @@ class ChannelsRuntime:
                 else {}
             )
             try:
-                return await member[1].reply(ChannelMessage.model_validate_json(rows[0]["payload"]), text, context)
+                connection = member[1]
+                message = ChannelMessage.model_validate_json(rows[0]["payload"])
+                if isinstance(connection, MQTTConnection):
+                    return await connection.reply(message, text, context, reply_topic=mqtt_reply_topic)
+                return await connection.reply(message, text, context)
             except ChannelError as error:
                 raise ServiceError("unavailable" if error.retryable else "invalid_argument", str(error)) from None
             except (httpx.HTTPError, OSError, TimeoutError, ValueError, KeyError, TypeError, WebSocketException):
@@ -617,6 +634,7 @@ def definition() -> AppDefinition:
                     "invalid_argument", "Choose an active conversation Thread.", {"field": "fixed_thread_id"}
                 )
         route = await active.store.save_route(scope.workspace_id, route_id, body, principal_id=actor.id, create=create)
+        active.changed.set()
         return route.model_dump(exclude={"binding_id", "principal_id"})
 
     @router.post("/routes", name="add_channel_route", status_code=201)
@@ -638,7 +656,9 @@ def definition() -> AppDefinition:
         route_id: ChannelId, runtime: CurrentRuntime, actor: Actor, workspace_id: WorkspaceId
     ) -> None:
         scope = await writable_scope(runtime, actor, workspace_id)
-        await require_channels().store.delete_route(scope.workspace_id, route_id)
+        active = require_channels()
+        await active.store.delete_route(scope.workspace_id, route_id)
+        active.changed.set()
 
     async def save_github(platform, body, runtime, actor, workspace_id, channel_id=None):
         scope = await writable_scope(runtime, actor, workspace_id)
