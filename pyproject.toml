@@ -1,12 +1,13 @@
 [project]
 name = "a13n-channels"
-version = "0.6.37"
+version = "0.6.38"
 description = "Channels"
 readme = "README.md"
 license-files = ["frontend/src/icons/NOTICE.md"]
 requires-python = ">=3.13"
 dependencies = [
     "a13n-service",
+    "cryptography>=3.4",
     "httpx>=0.28,<1",
     "websockets>=15,<16",
     "qrcode>=8,<9",
