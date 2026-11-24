@@ -369,7 +369,6 @@ class QQConnection:
                 raise ValueError("The Agent Environment did not supply the media file.")
             if kind in {"private", "group"}:
                 body["media"] = {"file_info": await self._media_upload(base, rich, filename, data)}
-                body.setdefault("content", " ")
                 message_type = 7
             elif data is None:
                 body["image"] = rich.url

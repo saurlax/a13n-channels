@@ -8,6 +8,7 @@ import sqlite3
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
+from datetime import UTC, datetime
 from secrets import token_hex
 
 import httpx
@@ -23,10 +24,10 @@ from a13n_service.resources.uploads import service as uploads
 from a13n_service.runs import entries, runs, submit
 from a13n_service.runs.runtime import Runtime
 from a13n_service.runs.schemas import Failure, Message, NewThread
-from a13n_service.runs.tables import RunRow
+from a13n_service.runs.tables import InboxEntryRow, RunRow, ThreadRow
 from a13n_service.tenancy.access import principal_for
 from a13n_service.tenancy.authorize import Principal, WorkspaceScope, allowed_verbs, authorize
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from a13n_channels.accounts import Accounts
@@ -104,11 +105,17 @@ class Deliveries:
         slots = ", ".join("?" for _ in workspaces)
         jobs = await self.store.query(
             f"""SELECT job.* FROM channel_deliveries job
+                LEFT JOIN channel_route_context_resets reset ON reset.route_id = job.route_id
                 WHERE job.workspace_id IN ({slots}) AND job.status IN ('wake_queued', 'wake_submitted', 'queued', 'submitted') AND job.next_at <= ?
                   AND (job.status = 'submitted' OR NOT EXISTS (
                       SELECT 1 FROM channel_deliveries prior
-                      WHERE prior.destination = job.destination
+                      WHERE prior.workspace_id = job.workspace_id AND prior.destination = job.destination
                         AND prior.status IN ('wake_queued', 'wake_submitted', 'queued') AND prior.rowid < job.rowid
+                        AND (prior.route_id != job.route_id
+                          OR (CASE WHEN prior.tool_key IS NULL THEN COALESCE(reset.generation, 0)
+                                  ELSE COALESCE(json_extract(prior.tool_request, '$.context_generation'), 0) END)
+                          = (CASE WHEN job.tool_key IS NULL THEN COALESCE(reset.generation, 0)
+                                  ELSE COALESCE(json_extract(job.tool_request, '$.context_generation'), 0) END))
                   ))
                 ORDER BY job.next_at, job.rowid LIMIT 16""",
             *workspaces,
@@ -269,14 +276,6 @@ class Deliveries:
         if route.thread_policy in {"conversation", "sender"}:
             conversation = job["conversation_id"] if route.thread_policy == "conversation" else job["destination"]
             scope = (job["binding_id"], job["channel_id"], job["account_id"], job["kind"], conversation)
-        if scope is not None:
-            threads = await self.store.query(
-                """SELECT thread_id FROM channel_threads
-                   WHERE binding_id = ? AND channel_id = ? AND account_id = ? AND kind = ? AND conversation_id = ?""",
-                *scope,
-            )
-            if threads:
-                thread_id = threads[0]["thread_id"]
         source = json.dumps(
             {
                 "channel": platform,
@@ -307,10 +306,14 @@ class Deliveries:
             "payload": {"content": [{"type": "text", "text": (header + message.text)[:65536]}]},
         }
         key = job["tool_key"]
+        generation = route.context_generation
         if key is not None:
             request = json.loads(job["tool_request"])
             thread_id, body = request["thread_id"], request["body"]
+            generation = request.get("context_generation", 0)
         else:
+            if scope is not None:
+                thread_id = await self.retained_thread(job["workspace_id"], scope, route.context_idle_seconds)
             agent = await agents.get_agent(self.runtime.storage, actor, job["workspace_id"], job["agent_id"])
             if agent.archived_at or not agent.default_revision_id:
                 raise ServiceError("invalid_argument", "The route target needs a published Agent.")
@@ -342,10 +345,14 @@ class Deliveries:
             key = "channels-" + token_hex(32)
             frozen = await self.store.query(
                 """UPDATE channel_deliveries SET tool_key = ?, tool_request = ?
-                   WHERE id = ? AND status = 'queued' AND tool_key IS NULL RETURNING id""",
+                   WHERE id = ? AND status = 'queued' AND tool_key IS NULL
+                     AND COALESCE((SELECT generation FROM channel_route_context_resets
+                                   WHERE route_id = channel_deliveries.route_id), 0) = ?
+                   RETURNING id""",
                 key,
-                json.dumps({"thread_id": thread_id, "body": body}),
+                json.dumps({"thread_id": thread_id, "body": body, "context_generation": generation}),
                 job["id"],
+                generation,
             )
             if not frozen:
                 return
@@ -366,7 +373,59 @@ class Deliveries:
                 NewThread.model_validate(body),
                 request_key=key,
             )
-        await asyncio.to_thread(self.save_receipt, job, scope, receipt.thread.id, receipt.entry.id)
+        await asyncio.to_thread(self.save_receipt, job, scope, receipt.thread.id, receipt.entry.id, generation)
+
+    async def retained_thread(
+        self, workspace_id: str, scope: tuple[str, str, str, str, str], idle_seconds: int
+    ) -> str | None:
+        threads = await self.store.query(
+            """SELECT thread_id FROM channel_threads
+               WHERE binding_id = ? AND channel_id = ? AND account_id = ? AND kind = ? AND conversation_id = ?""",
+            *scope,
+        )
+        if not threads:
+            return None
+        thread_id = threads[0]["thread_id"]
+        cutoff = datetime.fromtimestamp(max(time.time() - idle_seconds, 0), UTC)
+        return thread_id if await self.has_context_activity(workspace_id, thread_id, cutoff) else None
+
+    async def has_context_activity(self, workspace_id: str, thread_id: str, cutoff: datetime) -> bool:
+        # The Host owns run and inbox state, including child work after a coordinator yields.
+        family = (
+            select(ThreadRow.id, ThreadRow.current_run_id, ThreadRow.last_run_id)
+            .where(ThreadRow.workspace_id == workspace_id, ThreadRow.id == thread_id)
+            .cte(recursive=True)
+        )
+        family = family.union_all(
+            select(ThreadRow.id, ThreadRow.current_run_id, ThreadRow.last_run_id).where(
+                ThreadRow.workspace_id == workspace_id,
+                ThreadRow.origin == "child",
+                ThreadRow.origin_thread_id == family.c.id,
+            )
+        )
+        active = (
+            select(family.c.id)
+            .outerjoin(RunRow, RunRow.id == family.c.last_run_id)
+            .where(
+                or_(
+                    family.c.current_run_id.is_not(None),
+                    RunRow.status == "waiting",
+                    RunRow.sealed_at > cutoff,
+                    select(InboxEntryRow.id)
+                    .where(
+                        InboxEntryRow.thread_id == family.c.id,
+                        or_(
+                            InboxEntryRow.finished_at.is_(None),
+                            InboxEntryRow.finished_at > cutoff,
+                            InboxEntryRow.created_at > cutoff,
+                        ),
+                    )
+                    .exists(),
+                )
+            )
+        )
+        async with short_session(self.runtime.storage) as session:
+            return bool(await session.scalar(select(active.exists())))
 
     async def inline_images(
         self,
@@ -444,7 +503,12 @@ class Deliveries:
             return []
 
     def save_receipt(
-        self, job: sqlite3.Row, scope: tuple[str, str, str, str, str] | None, thread_id: str, entry_id: str
+        self,
+        job: sqlite3.Row,
+        scope: tuple[str, str, str, str, str] | None,
+        thread_id: str,
+        entry_id: str,
+        generation: int,
     ) -> None:
         with self.store.transaction() as db:
             saved = db.execute(
@@ -454,7 +518,15 @@ class Deliveries:
                 (thread_id, entry_id, job["id"]),
             ).rowcount
             if saved and scope is not None:
-                db.execute("INSERT OR IGNORE INTO channel_threads VALUES (?, ?, ?, ?, ?, ?)", (*scope, thread_id))
+                db.execute(
+                    """INSERT INTO channel_threads
+                       (binding_id, channel_id, account_id, kind, conversation_id, thread_id)
+                       SELECT ?, ?, ?, ?, ?, ?
+                       WHERE COALESCE((SELECT generation FROM channel_route_context_resets WHERE route_id = ?), 0) = ?
+                       ON CONFLICT (binding_id, channel_id, account_id, kind, conversation_id) DO UPDATE SET
+                           thread_id = excluded.thread_id""",
+                    (*scope, thread_id, job["route_id"], generation),
+                )
 
     def claim_failure_notice(self, delivery_id: str, status: str, text: str) -> bool:
         with self.store.transaction() as db:

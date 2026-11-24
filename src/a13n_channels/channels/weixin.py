@@ -46,6 +46,10 @@ class PairingPoll(BaseModel):
     verify_code: Annotated[str, Field(min_length=1, max_length=16, pattern=r"^[0-9]+$")] | None = None
 
 
+class PairingSave(PairingPoll):
+    name: str | None = Field(default=None, min_length=1, max_length=80)
+
+
 class PairingResult(BaseModel):
     status: PairingState
     qr_image: str | None = None

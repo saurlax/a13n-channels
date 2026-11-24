@@ -133,7 +133,8 @@ def test_qq_attachment_fetch_pins_tls_origin_and_revalidates_redirects(monkeypat
 
 
 @pytest.mark.parametrize("kind,path", [("private", "/v2/users/room"), ("group", "/v2/groups/room")])
-def test_qq_sends_url_and_environment_images_as_media(kind, path):
+@pytest.mark.parametrize("caption", [None, "caption"])
+def test_qq_sends_url_and_environment_images_as_media(kind, path, caption):
     requests = []
 
     def request(req):
@@ -148,15 +149,20 @@ def test_qq_sends_url_and_environment_images_as_media(kind, path):
         async with httpx.AsyncClient(transport=httpx.MockTransport(request)) as client:
             bot = connection(client)
             source = incoming().model_copy(update={"kind": kind})
-            assert await bot.reply(source, None, 1, rich=QQMedia(type="media", path="/photo.png"), data=PNG) == "sent"
+            assert (
+                await bot.reply(source, caption, 1, rich=QQMedia(type="media", path="/photo.png"), data=PNG) == "sent"
+            )
             assert (
                 await bot.send_proactive(
-                    kind, "room", "caption", rich=QQMedia(type="media", url="https://assets.example.com/photo.png")
+                    kind, "room", caption, rich=QQMedia(type="media", url="https://assets.example.com/photo.png")
                 )
                 == "sent"
             )
 
     asyncio.run(exercise())
+    media_message = {"msg_type": 7, "media": {"file_info": "receipt"}}
+    if caption is not None:
+        media_message["content"] = caption
     assert requests == [
         (
             path + "/files",
@@ -169,7 +175,7 @@ def test_qq_sends_url_and_environment_images_as_media(kind, path):
         ),
         (
             path + "/messages",
-            {"msg_id": "source", "msg_seq": 1, "content": " ", "msg_type": 7, "media": {"file_info": "receipt"}},
+            {"msg_id": "source", "msg_seq": 1, **media_message},
         ),
         (
             path + "/files",
@@ -180,7 +186,41 @@ def test_qq_sends_url_and_environment_images_as_media(kind, path):
                 "url": "https://assets.example.com/photo.png",
             },
         ),
-        (path + "/messages", {"content": "caption", "msg_type": 7, "media": {"file_info": "receipt"}}),
+        (path + "/messages", media_message),
+    ]
+
+
+@pytest.mark.parametrize("media_kind,file_type", [("audio", 3), ("video", 2), ("file", 4)])
+def test_qq_sends_text_and_non_image_media_in_separate_messages(media_kind, file_type):
+    requests = []
+    media = QQMedia(type="media", kind=media_kind, url="https://assets.example.com/sample")
+
+    def request(req):
+        if req.url.path == "/app/getAppAccessToken":
+            return token_response()
+        requests.append((req.url.path, json.loads(req.content)))
+        return httpx.Response(200, json={"file_info": "receipt"} if req.url.path.endswith("/files") else {"id": "sent"})
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(request)) as client:
+            bot = connection(client)
+            with pytest.raises(ValueError, match="separately from text"):
+                await bot.reply(incoming(), "description", 1, rich=media)
+            assert requests == []
+            assert await bot.reply(incoming(), "description", 1) == "sent"
+            assert await bot.reply(incoming(), None, 2, rich=media) == "sent"
+
+    asyncio.run(exercise())
+    assert requests == [
+        ("/v2/groups/room/messages", {"msg_id": "source", "msg_seq": 1, "msg_type": 0, "content": "description"}),
+        (
+            "/v2/groups/room/files",
+            {"file_type": file_type, "file_name": "sample", "srv_send_msg": False, "url": media.url},
+        ),
+        (
+            "/v2/groups/room/messages",
+            {"msg_id": "source", "msg_seq": 2, "msg_type": 7, "media": {"file_info": "receipt"}},
+        ),
     ]
 
 

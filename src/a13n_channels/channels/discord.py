@@ -20,6 +20,7 @@ API = "https://discord.com/api/v10"
 GUILD_MESSAGES = 1 << 9
 DIRECT_MESSAGES = 1 << 12
 MESSAGE_CONTENT = 1 << 15
+APP_MESSAGE_CONTENT_FLAGS = (1 << 18) | (1 << 19)
 FATAL_CLOSE_CODES = {4004, 4010, 4011, 4012, 4013, 4014}
 RESET_CLOSE_CODES = {4007, 4009}
 SNOWFLAKE = re.compile(r"[0-9]{1,20}")
@@ -42,13 +43,6 @@ def _token(config: Configuration) -> str:
     if not token or any(char.isspace() or not char.isascii() or not char.isprintable() for char in token):
         raise ChannelError("Enter a Discord bot token.")
     return token
-
-
-def _intents(config: Configuration) -> int:
-    message_content = config.get("message_content", "").strip().lower()
-    if message_content not in {"", "false", "true"}:
-        raise ChannelError("Set the Discord message content intent to true or false.")
-    return GUILD_MESSAGES | DIRECT_MESSAGES | (MESSAGE_CONTENT if message_content == "true" else 0)
 
 
 def _gateway_url(raw: str) -> str:
@@ -110,7 +104,6 @@ async def _request(http: httpx.AsyncClient, token: str, method: str, path: str, 
 
 
 async def bind(http: httpx.AsyncClient, config: Configuration) -> str:
-    _intents(config)
     profile = await _request(http, _token(config), "GET", "/users/@me")
     try:
         if profile.get("bot") is True:
@@ -168,7 +161,7 @@ class DiscordConnection:
         self.channel_id = channel_id
         self.identity = _id(identity)
         self.token = _token(config)
-        self.intents = _intents(config)
+        self.intents = GUILD_MESSAGES | DIRECT_MESSAGES
         self.gateway: str | None = None
         self.session: GatewaySession | None = None
 
@@ -182,7 +175,10 @@ class DiscordConnection:
                 await self._socket(ingest, status)
             except ConnectionClosed as error:
                 code = error.rcvd.code if error.rcvd is not None else None
-                if code in FATAL_CLOSE_CODES:
+                if code == 4014 and self.intents & MESSAGE_CONTENT:
+                    self.intents &= ~MESSAGE_CONTENT
+                    self.session = None
+                elif code in FATAL_CLOSE_CODES:
                     status("login_required")
                     return
                 if code in RESET_CLOSE_CODES:
@@ -205,6 +201,9 @@ class DiscordConnection:
     async def _socket(self, ingest: Ingest, status: Callable[[str], None]) -> None:
         if self.gateway is None:
             value = await _request(self.http, self.token, "GET", "/gateway/bot")
+            application = await _request(self.http, self.token, "GET", "/applications/@me")
+            if application.get("flags", 0) & APP_MESSAGE_CONTENT_FLAGS:
+                self.intents |= MESSAGE_CONTENT
             self.gateway = _gateway_url(value["url"])
         url = self.session.url if self.session else self.gateway
         async with connect(url, proxy=None, open_timeout=10, close_timeout=3, max_size=8 << 20) as socket:
@@ -325,16 +324,7 @@ ADAPTER = Adapter(
     label="Discord",
     label_zh="Discord",
     kinds=("private", "channel"),
-    fields=(
-        CredentialField("bot_token", "Bot token", "机器人令牌"),
-        CredentialField(
-            "message_content",
-            "Message Content Intent (true or false)",
-            "消息内容意图（true 或 false）",
-            secret=False,
-            required=False,
-        ),
-    ),
+    fields=(CredentialField("bot_token", "Bot token", "机器人令牌"),),
     bind=bind,
     connect=DiscordConnection,
 )

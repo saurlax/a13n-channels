@@ -77,6 +77,8 @@ class Accounts:
                     db.execute("ALTER TABLE channel_deliveries ADD COLUMN destination TEXT NOT NULL DEFAULT ''")
                     db.execute("""UPDATE channel_deliveries SET destination =
                         json_array('conversation', channel_id, account_id, kind, conversation_id)""")
+                if not any(row[1] == "mqtt_reply_topic" for row in db.execute("PRAGMA table_info(channel_deliveries)")):
+                    db.execute("ALTER TABLE channel_deliveries ADD COLUMN mqtt_reply_topic TEXT")
                 if not any(row[1] == "tool_key" for row in db.execute("PRAGMA table_info(channel_deliveries)")):
                     db.execute("ALTER TABLE channel_deliveries ADD COLUMN tool_key TEXT")
                     db.execute("ALTER TABLE channel_deliveries ADD COLUMN tool_request TEXT")
@@ -143,10 +145,48 @@ class Accounts:
         with self.transaction() as db:
             return db.execute(sql, args).fetchall()
 
+    async def rename(self, workspace_id: str, channel_id: str, name: str) -> bool:
+        def update() -> bool:
+            with self.transaction() as db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute(
+                    "SELECT platform FROM channel_accounts WHERE workspace_id = ? AND id = ?",
+                    (workspace_id, channel_id),
+                ).fetchone()
+                if row is None:
+                    return False
+                table = {
+                    "qq": "qq_accounts",
+                    "weixin": "weixin_accounts",
+                    "github": "github_accounts",
+                    "github_app": "github_accounts",
+                }.get(row["platform"], "connector_accounts")
+                db.execute(
+                    f"UPDATE {table} SET name = ? WHERE workspace_id = ? AND id = ?", (name, workspace_id, channel_id)
+                )
+                return True
+
+        return await asyncio.to_thread(update)
+
     async def routes(self, workspace_id: str) -> list[Route]:
         def load() -> list[Route]:
             with self.transaction() as db:
                 return read_routes(db, workspace_id)
+
+        return await asyncio.to_thread(load)
+
+    async def mqtt_subscriptions(self, workspace_ids: set[str]) -> dict[str, set[str]]:
+        def load() -> dict[str, set[str]]:
+            subscriptions: dict[str, set[str]] = {}
+            with self.transaction() as db:
+                for workspace_id in workspace_ids:
+                    for route in read_routes(db, workspace_id):
+                        if not route.enabled or not route.principal_id:
+                            continue
+                        for source in route.sources:
+                            if source.kind == "topic" and source.channel_id != "*" and source.conversation_id != "*":
+                                subscriptions.setdefault(source.channel_id, set()).add(source.conversation_id)
+            return subscriptions
 
         return await asyncio.to_thread(load)
 
@@ -185,11 +225,24 @@ class Accounts:
                     if channel_id in body.allowed_users:
                         raise ServiceError("invalid_argument", "Choose an account for each allowed user.")
                     continue
-                if not db.execute(
-                    "SELECT id FROM channel_accounts WHERE id = ? AND workspace_id = ?",
+                account = db.execute(
+                    "SELECT * FROM channel_accounts WHERE id = ? AND workspace_id = ?",
                     (channel_id, workspace_id),
-                ).fetchone():
+                ).fetchone()
+                if not account:
                     raise ServiceError("invalid_argument", "Choose a channel in this workspace.")
+                if (
+                    body.enabled
+                    and account["platform"] == "mqtt"
+                    and any(
+                        source.channel_id == channel_id and (source.kind != "topic" or source.conversation_id == "*")
+                        for source in body.sources
+                    )
+                    and not self.connector_credentials(account).get("topic_filter")
+                ):
+                    raise ServiceError(
+                        "invalid_argument", "Enter an MQTT subscription filter in Sources.", {"field": "mqtt_source"}
+                    )
             if any(source.repository and source.channel_id not in github_channels for source in body.sources):
                 raise ServiceError("invalid_argument", "Choose a GitHub channel for a repository source.")
             destination_changed = previous is not None and (
@@ -232,10 +285,12 @@ class Accounts:
                         include={
                             "sources",
                             "thread_policy",
+                            "context_idle_seconds",
                             "fixed_thread_id",
                             "multiparty_messages",
                             "wake_agent_id",
                             "allowed_users",
+                            "mqtt_reply_topic",
                         }
                     ),
                     binding_id,
@@ -267,6 +322,31 @@ class Accounts:
                 db.execute("DELETE FROM channel_threads WHERE binding_id = ?", (row["binding_id"],))
 
         await asyncio.to_thread(delete)
+
+    async def reset_conversations(self, workspace_id: str, route_id: str) -> None:
+        def reset() -> None:
+            with self.transaction() as db:
+                row = db.execute(
+                    """UPDATE channel_routes SET sources = json_remove(sources, '$.fixed_thread_id')
+                       WHERE workspace_id = ? AND id = ? RETURNING binding_id""",
+                    (workspace_id, route_id),
+                ).fetchone()
+                if row is None:
+                    raise not_found("channel_route", route_id)
+                db.execute(
+                    """INSERT INTO channel_route_context_resets (route_id, generation) VALUES (?, 1)
+                       ON CONFLICT (route_id) DO UPDATE SET generation = generation + 1""",
+                    (route_id,),
+                )
+                db.execute("DELETE FROM channel_threads WHERE binding_id = ?", (row["binding_id"],))
+                db.execute(
+                    """UPDATE channel_deliveries SET destination = json_array('route', binding_id)
+                       WHERE route_id = ? AND binding_id = ? AND status IN ('wake_queued', 'wake_submitted', 'queued')
+                           AND tool_key IS NULL AND json_extract(destination, '$[0]') = 'thread'""",
+                    (route_id, row["binding_id"]),
+                )
+
+        await asyncio.to_thread(reset)
 
     @staticmethod
     def _stop_deliveries(db: sqlite3.Connection, route_id: str) -> None:

@@ -10,6 +10,7 @@ from a13n_service.infra.errors import ServiceError
 from pydantic import BaseModel, Field, StringConstraints, model_validator
 
 from a13n_channels.channels.github import GITHUB_KINDS, RepositoryName
+from a13n_channels.channels.mqtt import matches_topic, valid_publish_topic, valid_subscription_filter
 from a13n_channels.messages import ChannelMessage
 
 type Choice = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=512)]
@@ -23,6 +24,10 @@ SCHEMA = """
         binding_id TEXT NOT NULL, principal_id TEXT
     );
     CREATE INDEX IF NOT EXISTS channel_routes_workspace ON channel_routes (workspace_id);
+    CREATE TABLE IF NOT EXISTS channel_route_context_resets (
+        route_id TEXT PRIMARY KEY REFERENCES channel_routes(id) ON DELETE CASCADE,
+        generation INTEGER NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS channel_threads (
         binding_id TEXT NOT NULL, channel_id TEXT NOT NULL, account_id TEXT NOT NULL,
         kind TEXT NOT NULL, conversation_id TEXT NOT NULL, thread_id TEXT NOT NULL,
@@ -34,7 +39,7 @@ SCHEMA = """
         account_id TEXT NOT NULL, kind TEXT NOT NULL, conversation_id TEXT NOT NULL,
         message_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued',
         thread_id TEXT, entry_id TEXT, run_id TEXT, next_at REAL NOT NULL DEFAULT 0,
-        error TEXT, destination TEXT NOT NULL
+        error TEXT, destination TEXT NOT NULL, mqtt_reply_topic TEXT
     );
     CREATE TABLE IF NOT EXISTS channel_sends (
         delivery_id TEXT NOT NULL REFERENCES channel_deliveries(id) ON DELETE CASCADE,
@@ -82,6 +87,8 @@ class Source(BaseModel, frozen=True):
             raise ValueError("A repository requires a GitHub account and repository-level conversation matching.")
         if self.kind == "*" and self.conversation_id != "*":
             raise ValueError("An exact conversation requires a conversation type.")
+        if self.kind == "topic" and self.conversation_id != "*" and not valid_subscription_filter(self.conversation_id):
+            raise ValueError("Enter a valid MQTT subscription filter.")
         if self.mentions_only and self.kind not in MULTIPARTY_KINDS:
             raise ValueError("Mention filtering requires a group or channel conversation type.")
         return self
@@ -91,14 +98,20 @@ class Source(BaseModel, frozen=True):
         return self.channel_id, self.kind, self.conversation_id, self.repository.lower() if self.repository else None
 
     @property
-    def specificity(self) -> tuple[bool, bool, bool, bool]:
-        return (self.conversation_id != "*", self.repository is not None, self.channel_id != "*", self.kind != "*")
+    def specificity(self) -> tuple[int, bool, bool, bool]:
+        conversation = 0
+        if self.conversation_id != "*":
+            conversation = 1 if self.kind == "topic" and any(c in self.conversation_id for c in "+#") else 2
+        return (conversation, self.repository is not None, self.channel_id != "*", self.kind != "*")
 
     def matches(self, channel_id: str, kind: str, conversation_id: str) -> bool:
         return (
             self.channel_id in {"*", channel_id}
             and self.kind in {"*", kind}
-            and self.conversation_id in {"*", conversation_id}
+            and (
+                self.conversation_id in {"*", conversation_id}
+                or (self.kind == "topic" and matches_topic(self.conversation_id, conversation_id))
+            )
             and (
                 self.repository is None
                 or (kind in GITHUB_KINDS and conversation_id.rpartition("#")[0].lower() == self.repository.lower())
@@ -112,9 +125,11 @@ class RouteInput(BaseModel):
     enabled: bool = True
     sources: list[Source] = Field(min_length=1, max_length=100)
     thread_policy: ThreadPolicy = "conversation"
+    context_idle_seconds: int = Field(default=3600, strict=True, ge=1, le=2**53 - 1)
     fixed_thread_id: Choice | None = None
     multiparty_messages: Literal["all", "mentions"] | None = None
     wake_agent_id: Choice | None = None
+    mqtt_reply_topic: Choice | None = None
     allowed_users: dict[Choice, Annotated[list[Choice], Field(min_length=1, max_length=100)]] = Field(
         default_factory=dict, max_length=100
     )
@@ -129,6 +144,8 @@ class RouteInput(BaseModel):
     def unique_sources(self) -> "RouteInput":
         if self.fixed_thread_id is not None and self.thread_policy != "fixed":
             raise ValueError("A Thread ID requires the fixed Thread policy.")
+        if self.mqtt_reply_topic is not None and not valid_publish_topic(self.mqtt_reply_topic):
+            raise ValueError("Enter a valid MQTT reply topic.")
         if self.wake_agent_id == self.agent_id:
             raise ValueError("Choose a different wake Agent from the target Agent.")
         return self
@@ -138,6 +155,7 @@ class Route(RouteInput):
     id: str
     binding_id: str
     principal_id: str | None
+    context_generation: int = Field(default=0, exclude=True)
 
 
 def github_channel_ids(db: sqlite3.Connection, workspace_id: str) -> set[str]:
@@ -146,7 +164,12 @@ def github_channel_ids(db: sqlite3.Connection, workspace_id: str) -> set[str]:
 
 def read_routes(db: sqlite3.Connection, workspace_id: str) -> list[Route]:
     routes = []
-    for row in db.execute("SELECT * FROM channel_routes WHERE workspace_id = ? ORDER BY name, id", (workspace_id,)):
+    for row in db.execute(
+        """SELECT route.*, COALESCE(reset.generation, 0) AS context_generation
+           FROM channel_routes route LEFT JOIN channel_route_context_resets reset ON reset.route_id = route.id
+           WHERE route.workspace_id = ? ORDER BY route.name, route.id""",
+        (workspace_id,),
+    ):
         config = json.loads(row["sources"])
         routes.append(
             Route(
@@ -156,6 +179,7 @@ def read_routes(db: sqlite3.Connection, workspace_id: str) -> list[Route]:
                 name=row["name"],
                 agent_id=row["agent_id"],
                 enabled=bool(row["enabled"]),
+                context_generation=row["context_generation"],
                 **config,
             )
         )
@@ -235,8 +259,8 @@ def enqueue(db: sqlite3.Connection, workspace_id: str, account_id: str, message:
     db.execute(
         """INSERT INTO channel_deliveries
            (id, workspace_id, route_id, binding_id, agent_id, channel_id, account_id, kind, conversation_id,
-            message_id, destination, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            message_id, destination, status, mqtt_reply_topic)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             key,
             workspace_id,
@@ -250,5 +274,6 @@ def enqueue(db: sqlite3.Connection, workspace_id: str, account_id: str, message:
             message.id,
             json.dumps(scope, ensure_ascii=False, separators=(",", ":")),
             "wake_queued" if route.wake_agent_id else "queued",
+            route.mqtt_reply_topic if message.kind == "topic" else None,
         ),
     )

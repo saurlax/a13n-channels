@@ -292,6 +292,7 @@ def test_matched_text_retries_same_submission_and_reuses_source_thread(
             return SimpleNamespace(status="completed", resumed_by_id=None)
 
         monkeypatch.setattr(delivery, "short_session", session)
+        monkeypatch.setattr(Deliveries, "has_context_activity", AsyncMock(return_value=True))
         monkeypatch.setattr(delivery, "principal_for", owner)
         monkeypatch.setattr(delivery, "resolve_model", model)
         monkeypatch.setattr(delivery, "open_attachment", download)
@@ -400,12 +401,185 @@ def test_thread_destination_controls_reuse_and_queue_order(
         monkeypatch.setattr(delivery.submit, "submit_message", append)
         monkeypatch.setattr(Deliveries, "actor", actor)
         monkeypatch.setattr(Deliveries, "collect", collect)
+        monkeypatch.setattr(Deliveries, "has_context_activity", AsyncMock(return_value=True))
         deliveries = Deliveries(store, SimpleNamespace(storage=None), AsyncMock())
         await deliveries.process({"channel": account})
         assert len(submissions) == first_batch
         for _ in range(3):
             await deliveries.process({"channel": account})
         assert submissions == expected
+
+    asyncio.run(exercise())
+
+
+def test_managed_thread_rolls_over_after_idle_and_freezes_retry(tmp_path, monkeypatch, published_agent):
+    async def exercise():
+        store = store_for(tmp_path)
+        await store.initialize()
+        await store.query(
+            "INSERT INTO qq_accounts VALUES ('channel', 'org', 'workspace', 'Bot', 'bot', 'credentials', 1)"
+        )
+        account = (await store.query("SELECT *, 'qq' AS platform FROM qq_accounts"))[0]
+        route = rule("Route", "ag_012345678901234567890123456789ab", ("channel", "*", "*"))
+        assert route.context_idle_seconds == 3600
+        route = route.model_copy(update={"context_idle_seconds": 10})
+        await store.save_route("workspace", "route", route, principal_id="owner", create=True)
+        assert (await store.routes("workspace"))[0].context_idle_seconds == 10
+
+        clock = SimpleNamespace(now=100)
+        monkeypatch.setattr(delivery, "time", SimpleNamespace(time=lambda: clock.now))
+        submissions = []
+
+        async def create(_runtime, _actor, _workspace, message, *, request_key):
+            name = channel_input(message)[0]["message_id"]
+            submissions.append((name, None, request_key))
+            if name == "expired" and len(submissions) == 4:
+                raise ServiceError("unavailable", "Retry this submission.")
+            return SimpleNamespace(thread=SimpleNamespace(id=f"new-{name}"), entry=SimpleNamespace(id=name)), True
+
+        async def append(_runtime, _actor, _workspace, thread_id, message, *, request_key):
+            name = channel_input(message)[0]["message_id"]
+            submissions.append((name, thread_id, request_key))
+            return SimpleNamespace(thread=SimpleNamespace(id=thread_id), entry=SimpleNamespace(id=name)), True
+
+        monkeypatch.setattr(delivery.submit, "create_thread", create)
+        monkeypatch.setattr(delivery.submit, "submit_message", append)
+        monkeypatch.setattr(Deliveries, "actor", AsyncMock(return_value=object()))
+        monkeypatch.setattr(Deliveries, "collect", AsyncMock())
+        activity = AsyncMock(side_effect=[True, True, False])
+        monkeypatch.setattr(Deliveries, "has_context_activity", activity)
+        deliveries = Deliveries(store, SimpleNamespace(storage=None), AsyncMock())
+
+        for name, now in [("first", 100), ("recent", 109), ("active", 119), ("expired", 129)]:
+            clock.now = now
+            await store.receive(incoming(name), "credentials")
+            await deliveries.process({"channel": account})
+
+        assert [(name, target) for name, target, _key in submissions] == [
+            ("first", None),
+            ("recent", "new-first"),
+            ("active", "new-first"),
+            ("expired", None),
+        ]
+        assert [call.args[2].timestamp() for call in activity.await_args_list] == [99, 109, 119]
+        assert (await store.query("SELECT thread_id FROM channel_threads"))[0]["thread_id"] == "new-first"
+
+        route = route.model_copy(update={"context_idle_seconds": 3600})
+        await store.save_route("workspace", "route", route, principal_id="owner", create=False)
+        clock.now = 159
+        await deliveries.process({"channel": account})
+        assert submissions[-1] == submissions[-2]
+        assert (await store.query("SELECT thread_id FROM channel_threads"))[0]["thread_id"] == "new-expired"
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("fixed_thread_id", [None, "pinned-thread"])
+def test_reset_conversations_keeps_running_and_frozen_deliveries_on_their_threads(
+    fixed_thread_id, tmp_path, monkeypatch, published_agent
+):
+    async def exercise():
+        store = store_for(tmp_path)
+        await store.initialize()
+        await store.query(
+            "INSERT INTO qq_accounts VALUES ('channel', 'org', 'workspace', 'Bot', 'bot', 'credentials', 1)"
+        )
+        account = (await store.query("SELECT *, 'qq' AS platform FROM qq_accounts"))[0]
+        route = rule("Route", "ag_012345678901234567890123456789ab", ("*", "*", "*"))
+        if fixed_thread_id:
+            route = route.model_copy(update={"thread_policy": "fixed", "fixed_thread_id": fixed_thread_id})
+        other = await store.save_route("other", "other-route", route, principal_id="owner", create=True)
+        await store.query(
+            "INSERT INTO channel_threads VALUES (?, 'other-channel', 'bot', 'private', 'other-user', 'other-thread')",
+            other.binding_id,
+        )
+        saved = await store.save_route("workspace", "route", route, principal_id="owner", create=True)
+        sibling_route = route.model_copy(
+            update={
+                "name": "Sibling",
+                "sources": [Source(channel_id="channel", kind="private", conversation_id="sibling")],
+            }
+        )
+        sibling = await store.save_route("workspace", "sibling", sibling_route, principal_id="owner", create=True)
+        await store.query(
+            "INSERT INTO channel_threads VALUES (?, 'channel', 'bot', 'private', 'sibling', 'sibling-thread')",
+            sibling.binding_id,
+        )
+
+        clock = SimpleNamespace(now=100)
+        monkeypatch.setattr(delivery, "time", SimpleNamespace(time=lambda: clock.now))
+        submissions = []
+
+        def receipt(name, thread_id):
+            return SimpleNamespace(thread=SimpleNamespace(id=thread_id), entry=SimpleNamespace(id=name)), True
+
+        async def create(_runtime, _actor, _workspace, body, *, request_key):
+            name = channel_input(body)[0]["message_id"]
+            submissions.append((name, None, request_key))
+            return receipt(name, f"thread-{name}")
+
+        async def append(_runtime, _actor, _workspace, thread_id, body, *, request_key):
+            name = channel_input(body)[0]["message_id"]
+            submissions.append((name, thread_id, request_key))
+            if name == "retry" and clock.now == 100:
+                raise ServiceError("unavailable", "Receipt unavailable.")
+            return receipt(name, thread_id)
+
+        monkeypatch.setattr(delivery.submit, "create_thread", create)
+        monkeypatch.setattr(delivery.submit, "submit_message", append)
+        monkeypatch.setattr(Deliveries, "actor", AsyncMock(return_value=object()))
+        collect = AsyncMock()
+        monkeypatch.setattr(Deliveries, "collect", collect)
+        monkeypatch.setattr(Deliveries, "has_context_activity", AsyncMock(return_value=True))
+        deliveries = Deliveries(store, SimpleNamespace(storage=None), AsyncMock())
+
+        for name in ("running", "retry"):
+            await store.receive(incoming(name), "credentials")
+            await deliveries.process({"channel": account})
+        original_thread = fixed_thread_id or "thread-running"
+        assert submissions[-1][:2] == ("retry", original_thread)
+        frozen = submissions[-1]
+        stale_routes = await store.routes("workspace")
+        await store.receive(incoming("queued"), "credentials")
+        stale_job = (await store.query("SELECT * FROM channel_deliveries WHERE message_id = 'queued'"))[0]
+
+        with pytest.raises(ServiceError) as missing:
+            await store.reset_conversations("workspace", other.id)
+        assert missing.value.code == "not_found"
+        await store.reset_conversations("workspace", saved.id)
+        routes = {item.id: item for item in await store.routes("workspace")}
+        reset_route = routes[saved.id]
+        assert reset_route.binding_id == saved.binding_id
+        assert reset_route.fixed_thread_id is None
+        assert reset_route.context_generation == 1
+        assert routes[sibling.id] == sibling
+        assert (await store.routes("other"))[0].fixed_thread_id == fixed_thread_id
+        assert {row["thread_id"] for row in await store.query("SELECT thread_id FROM channel_threads")} == {
+            "other-thread",
+            "sibling-thread",
+        }
+        await deliveries.advance(stale_job, account, stale_routes)
+        assert submissions[-1] == frozen
+
+        await store.receive(incoming("after"), "credentials")
+        await deliveries.process({"channel": account})
+        await deliveries.process({"channel": account})
+        assert [(name, target) for name, target, _ in submissions[-2:]] == [
+            ("queued", None),
+            ("after", "thread-queued"),
+        ]
+        active = (await store.query("SELECT status, thread_id FROM channel_deliveries WHERE message_id = 'running'"))[0]
+        assert tuple(active) == ("submitted", original_thread)
+        assert any(call.args[0]["message_id"] == "running" for call in collect.await_args_list)
+
+        clock.now = 130
+        await deliveries.process({"channel": account})
+        assert submissions[-1] == frozen
+        assert {row["thread_id"] for row in await store.query("SELECT thread_id FROM channel_threads")} == {
+            "other-thread",
+            "sibling-thread",
+            "thread-queued",
+        }
 
     asyncio.run(exercise())
 

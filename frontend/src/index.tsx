@@ -9,6 +9,7 @@ import "./app.css";
 
 const english = {
   title: "Channels", add: "Add channel", name: "Name", secret: "AppSecret",
+  rename: "Rename channel", nameRequired: "Enter a channel name.", renameError: "Could not save the channel name. Try again.",
   channelType: "Channel type", qq: "QQ Bot", weixin: "Weixin ClawBot", github: "GitHub", github_app: "GitHub App", status: "Status",
   githubToken: "Classic personal access token", privateKey: "Private key (PEM)",
   keepCurrent: "Leave blank to keep the current value",
@@ -30,6 +31,7 @@ const english = {
 
 const chinese: typeof english = {
   title: "渠道", add: "添加渠道", name: "名称", secret: "AppSecret",
+  rename: "重命名渠道", nameRequired: "请输入渠道名称。", renameError: "无法保存渠道名称，请重试。",
   channelType: "渠道类型", qq: "QQ 机器人", weixin: "微信 ClawBot", github: "GitHub", github_app: "GitHub App", status: "状态",
   githubToken: "Classic PAT", privateKey: "密钥",
   keepCurrent: "留空则保留当前值",
@@ -92,17 +94,96 @@ async function requireSuccess(response: Response) {
   return response;
 }
 
-function ChannelEditorHeader({ account, label, titleId }: {
+function ChannelEditorHeader({ account, label, text, titleId }: {
   account: Account;
   label: string;
+  text: typeof english;
   titleId: string;
 }) {
+  const app = useApp();
+  const client = useQueryClient();
+  const dialog = React.useRef<HTMLDialogElement>(null);
+  const [draft, setDraft] = React.useState(account.name);
+  const [pending, setPending] = React.useState(false);
+  const [error, setError] = React.useState("");
+
+  function openRename() {
+    setDraft(account.name);
+    setError("");
+    dialog.current?.showModal();
+  }
+
+  async function saveName(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (pending) return;
+    const name = draft.trim();
+    if (name === account.name) {
+      dialog.current?.close();
+      return;
+    }
+    if (!name) {
+      setError(text.nameRequired);
+      return;
+    }
+    setPending(true);
+    setError("");
+    try {
+      const response = await requireSuccess(await app.request(`/accounts/${encodeURIComponent(account.id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      }));
+      const saved = await response.json() as { name: string };
+      const queryKey = app.queryKey("channel-accounts");
+      client.setQueryData<Accounts>(queryKey, current => current && ({
+        ...current,
+        accounts: current.accounts.map(item => item.id === account.id ? { ...item, name: saved.name } : item),
+      }));
+      dialog.current?.close();
+      void client.invalidateQueries({ queryKey });
+    } catch {
+      setError(text.renameError);
+    } finally {
+      setPending(false);
+    }
+  }
+
   return (
     <header className="a13n-channel-edit-header">
-      <h2 id={titleId}>{account.name}</h2>
+      <div className="a13n-channel-edit-title">
+        <h2 id={titleId}>{account.name}</h2>
+        <Button type="button" variant="ghost" size="icon-xs" aria-label={text.rename} onClick={openRename}>
+          <svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none"
+            stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M15 5l4 4M4 20l4.5-1 11-11a1.4 1.4 0 0 0 0-2l-1.5-1.5a1.4 1.4 0 0 0-2 0l-11 11L4 20Z" />
+          </svg>
+        </Button>
+      </div>
       <p id={`${titleId}-description`} className="a13n-channel-icon-label">
         <ChannelIcon platform={account.platform} />{label}
       </p>
+      <dialog ref={dialog} className="a13n-qq-dialog a13n-channel-rename-dialog"
+        aria-labelledby={`${titleId}-rename`} onCancel={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          if (!pending) dialog.current?.close();
+        }}>
+        <form aria-busy={pending} onSubmit={saveName}>
+          <h2 id={`${titleId}-rename`}>{text.rename}</h2>
+          <label>{text.name}
+            <Input name="name" value={draft} required maxLength={80} readOnly={pending}
+              aria-invalid={Boolean(error)} aria-describedby={error ? `${titleId}-name-error` : undefined}
+              onChange={(event) => { setDraft(event.currentTarget.value); setError(""); }} />
+          </label>
+          {error && <p id={`${titleId}-name-error`} role="alert">{error}</p>}
+          <div className="a13n-qq-actions">
+            <Button type="button" variant="outline" disabled={pending} onClick={() => dialog.current?.close()}>
+              {text.cancel}
+            </Button>
+            <Button type="submit" disabled={pending}>{text.save}</Button>
+          </div>
+        </form>
+      </dialog>
     </header>
   );
 }
@@ -165,11 +246,10 @@ function DeleteChannelDialog({ account, text, dismiss, onDeleted }: {
   );
 }
 
-function AccountDialog({ action, text, dismiss, pair, requestDelete, qqScanAvailable, connectors }: {
+function AccountDialog({ action, text, dismiss, requestDelete, qqScanAvailable, connectors }: {
   action: Action;
   text: typeof english;
   dismiss: () => void;
-  pair: (account: Account) => void;
   requestDelete: (account: Account) => void;
   qqScanAvailable: boolean;
   connectors: Connector[];
@@ -186,10 +266,11 @@ function AccountDialog({ action, text, dismiss, pair, requestDelete, qqScanAvail
   const [qqMethod, setQQMethod] = React.useState(add && qqScanAvailable ? "scan" : "manual");
   const [scan, setScan] = React.useState<QQScan | null>(null);
   const [scanFailed, setScanFailed] = React.useState(false);
-  const [scanAttempt, retryScan] = React.useReducer((attempt: number) => attempt + 1, 0);
+  const [scanAttempt, setScanAttempt] = React.useState(0);
   const [draftAppId, setDraftAppId] = React.useState(account?.account_id ?? "");
   const [hasSecret, setHasSecret] = React.useState(false);
   const qqFields = platform === "qq";
+  const weixinFields = platform === "weixin";
   const githubFields = platform === "github" || platform === "github_app";
   const connector = connectors.find(item => item.key === platform);
   const scanning = qqFields && qqMethod === "scan";
@@ -239,7 +320,13 @@ function AccountDialog({ action, text, dismiss, pair, requestDelete, qqScanAvail
   }, [scanning, scanReady, scan?.login_id, platform]);
 
   React.useEffect(() => {
-    if (!scanning) return;
+    if (!scanning) {
+      setScanAttempt(0);
+      setScan(null);
+      setScanFailed(false);
+      return;
+    }
+    if (!scanAttempt) return;
     const controller = new AbortController();
     let path: string | undefined;
     function cancel() {
@@ -262,6 +349,7 @@ function AccountDialog({ action, text, dismiss, pair, requestDelete, qqScanAvail
           await new Promise((resolve) => setTimeout(resolve, 1000));
           if (controller.signal.aborted) return;
           result = await (await requireSuccess(await app.request(path, { signal: controller.signal }))).json();
+          if (controller.signal.aborted) return;
           setScan(result);
         }
         if (result.status !== "confirmed") setScanFailed(true);
@@ -276,9 +364,14 @@ function AccountDialog({ action, text, dismiss, pair, requestDelete, qqScanAvail
     };
   }, [scanning, scanAttempt]);
 
+  function readChannelName() {
+    if (!form.current?.reportValidity()) return null;
+    return String(new FormData(form.current).get("name"));
+  }
+
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (pending || testing || (scanning && !scanReady)) return;
+    if (weixinFields || pending || testing || (scanning && !scanReady)) return;
     setPending(true);
     setFailed(false);
     try {
@@ -307,7 +400,6 @@ function AccountDialog({ action, text, dismiss, pair, requestDelete, qqScanAvail
         return;
       }
       await requireSuccess(response);
-      if (add && platform === "weixin") pair(await response.json());
       dismiss();
     } catch (error) {
       setFailed((githubFields || connector) && error instanceof ApiError ? error.message : true);
@@ -320,13 +412,13 @@ function AccountDialog({ action, text, dismiss, pair, requestDelete, qqScanAvail
     dialog.current?.showModal();
   }, []);
   return (
-    <dialog ref={dialog} className="a13n-qq-dialog" aria-labelledby={titleId}
-      aria-describedby={editing ? `${titleId}-description` : undefined}
+    <dialog ref={dialog} className={weixinFields ? "a13n-qq-dialog a13n-weixin-pairing" : "a13n-qq-dialog"}
+      aria-labelledby={titleId} aria-describedby={editing ? `${titleId}-description` : undefined}
       onCancel={(event) => { event.preventDefault(); if (!pending) dismiss(); }}>
+      {editing && <ChannelEditorHeader account={action.account} label={platformName(platform, text, connectors)}
+        text={text} titleId={titleId} />}
       <form ref={form} onSubmit={submit}>
-        {editing
-          ? <ChannelEditorHeader account={action.account} label={platformName(platform, text, connectors)} titleId={titleId} />
-          : <h2 id={titleId}>{text.add}</h2>}
+        {add && <h2 id={titleId}>{text.add}</h2>}
         {add && <>
           <label htmlFor={`${titleId}-platform`}>{text.channelType}
             <ChannelSelect id={`${titleId}-platform`} label={text.channelType} container={dialog}
@@ -341,7 +433,8 @@ function AccountDialog({ action, text, dismiss, pair, requestDelete, qqScanAvail
           <label key={`${connector.key}:${field.key}`}>{text === chinese ? field.label_zh : field.label}
             <Input name={field.key} type={field.secret ? "password" : "text"}
               autoComplete={field.secret ? "new-password" : "off"} required={add && field.required}
-              placeholder={editing ? text.keepCurrent : undefined} maxLength={4096} disabled={pending} />
+              placeholder={editing ? text.keepCurrent : field.key === "broker_url" ? "mqtts://user:password@broker.example.com:8883" : undefined}
+              maxLength={4096} disabled={pending} />
           </label>
         ))}
         {githubFields && <>
@@ -375,62 +468,78 @@ function AccountDialog({ action, text, dismiss, pair, requestDelete, qqScanAvail
             <strong>{text.qqScanReady}</strong>
           </div>
         ) : <>
-          <p role={scanFailed ? "alert" : "status"}>{scanFailed ? text.error
-            : scan?.qr_image ? text.qqScanHelp : text.qrLoading}</p>
-          {!scanFailed && scan?.qr_image && <img className="a13n-weixin-qr" src={scan.qr_image} alt={text.qqQR} />}
-          {scanFailed && <Button type="button" variant="outline" onClick={retryScan}>{text.getCode}</Button>}
+          {!scanFailed && scan?.qr_image ? <>
+            <img className="a13n-pairing-qr" src={scan.qr_image} alt={text.qqQR} />
+            <p role="status">{text.qqScanHelp}</p>
+          </> : <PairingQRPlaceholder text={text} pending={scanAttempt > 0 && !scanFailed}
+            requestCode={() => {
+              setScanFailed(false);
+              setScanAttempt(attempt => attempt + 1);
+            }} />}
+          {scanFailed && <p role="alert">{text.error}</p>}
         </>)}
-        {qqFields && (!scanning || scanReady) && (
-          <div className={scanning ? "a13n-qq-test a13n-qq-test-center" : "a13n-qq-test"}>
-            {connection !== "idle" && <p role={connection === "failed" ? "alert" : "status"}>{
-              testing ? text.testing : connection === "success" ? text.testOK : text.testFailed
-            }</p>}
-            {(!scanning || connection === "failed") &&
-              <Button type="button" variant="outline" size="sm" disabled={pending || testing || (!scanning && !hasSecret)} onClick={() => void testConnection()}>
-                {text.test}
-              </Button>}
-          </div>
-        )}
+        {qqFields && (!scanning || scanReady) && connection !== "idle" &&
+          <p className={scanning ? "a13n-qq-test-center" : undefined}
+            role={connection === "failed" ? "alert" : "status"}>
+            {testing ? text.testing : connection === "success" ? text.testOK : text.testFailed}
+          </p>}
         {failed && <p role="alert">{typeof failed === "string" ? failed : text.error}</p>}
-        <div className="a13n-qq-actions">
+        {!weixinFields && <div className="a13n-qq-actions">
           {editing && <Button type="button" className="a13n-channel-delete" variant="destructive-outline"
             disabled={pending || testing} onClick={() => requestDelete(action.account)}>{text.remove}</Button>}
+          {qqFields && (!scanning || (scanReady && connection === "failed")) &&
+            <Button type="button" variant="outline" disabled={pending || testing || (!scanning && !hasSecret)}
+              onClick={() => void testConnection()}>{text.test}</Button>}
           <Button type="button" variant="outline" disabled={pending} onClick={dismiss}>{text.cancel}</Button>
           <Button type="submit" disabled={pending || testing || (scanning && !scanReady)}>
             {text.save}
           </Button>
-        </div>
+        </div>}
       </form>
+      {weixinFields && <WeixinPairing account={account} readChannelName={readChannelName}
+        text={text} dismiss={dismiss} requestDelete={requestDelete} setSaving={setPending} />}
     </dialog>
   );
 }
 
-function PairingDialog({ account, text, dismiss, requestDelete }: {
-  account: Account;
+function PairingQRPlaceholder({ text, pending, requestCode }: {
+  text: typeof english;
+  pending: boolean;
+  requestCode: () => void;
+}) {
+  return (
+    <div className="a13n-pairing-qr a13n-pairing-qr-placeholder">
+      {pending ? <span role="status">{text.qrLoading}</span>
+        : <Button type="button" variant="outline" onClick={requestCode}>{text.getCode}</Button>}
+    </div>
+  );
+}
+
+function WeixinPairing({ account, readChannelName, text, dismiss, requestDelete, setSaving }: {
+  account: Account | null;
+  readChannelName: () => string | null;
   text: typeof english;
   dismiss: () => void;
   requestDelete: (account: Account) => void;
+  setSaving: (saving: boolean) => void;
 }) {
   const app = useApp();
   const client = useQueryClient();
-  const dialog = React.useRef<HTMLDialogElement>(null);
   const active = React.useRef<AbortController | null>(null);
-  const loginId = React.useRef<string | null>(null);
-  const titleId = React.useId();
+  const ticket = React.useRef<string | null>(null);
+  const path = account ? `${accountPath(account)}/pair` : "/weixin/pair";
   const [pairing, setPairing] = React.useState<Pairing | null>(null);
   const [pending, setPending] = React.useState(false);
   const [failed, setFailed] = React.useState(false);
-  const path = `${accountPath(account)}/pair`;
   const terminal = ["expired", "verify_code_blocked", "binded_redirect"];
 
-  React.useEffect(() => {
-    dialog.current?.showModal();
-    return () => {
-      active.current?.abort();
-      if (loginId.current) void app.request(`${path}/${encodeURIComponent(loginId.current)}`, {
-        method: "DELETE",
-      }).catch(() => {});
-    };
+  function cancelTicket(id: string) {
+    void app.request(`${path}/${encodeURIComponent(id)}`, { method: "DELETE" }).catch(() => {});
+  }
+
+  React.useEffect(() => () => {
+    active.current?.abort();
+    if (ticket.current) cancelTicket(ticket.current);
   }, []);
 
   async function run(verifyCode?: string) {
@@ -442,14 +551,18 @@ function PairingDialog({ account, text, dismiss, requestDelete }: {
     try {
       let current = pairing;
       if (!verifyCode || !current) {
+        if (ticket.current) cancelTicket(ticket.current);
+        ticket.current = null;
         setPairing(null);
-        current = await (await requireSuccess(await app.request(path, {
-          method: "POST", signal: abort.signal,
-        }))).json() as Pairing;
-        loginId.current = current.login_id;
+        current = await (await requireSuccess(await app.request(path, { method: "POST" }))).json() as Pairing;
+        if (abort.signal.aborted) {
+          cancelTicket(current.login_id);
+          return;
+        }
+        ticket.current = current.login_id;
         setPairing(current);
       }
-      while (true) {
+      while (!abort.signal.aborted) {
         const response = await requireSuccess(await app.request(`${path}/status`, {
           method: "POST", headers: { "Content-Type": "application/json" }, signal: abort.signal,
           body: JSON.stringify({ login_id: current.login_id, verify_code: verifyCode }),
@@ -469,37 +582,40 @@ function PairingDialog({ account, text, dismiss, requestDelete }: {
   }
 
   async function savePairing() {
-    if (!pairing || pending) return;
+    const id = ticket.current;
+    if (!id || pending) return;
+    const name = account ? undefined : readChannelName();
+    if (name === null) return;
+    setSaving(true);
     setPending(true);
     setFailed(false);
     try {
       const response = await requireSuccess(await app.request(`${path}/save`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ login_id: pairing.login_id }),
+        body: JSON.stringify({ login_id: id, name }),
       }));
       if ((await response.json()).status !== "confirmed") {
-        setPairing({ ...pairing, status: "expired" });
+        setPairing(current => current && { ...current, status: "expired" });
         return;
       }
-      loginId.current = null;
+      ticket.current = null;
       void client.invalidateQueries({ queryKey: app.queryKey("channel-accounts") });
       dismiss();
     } catch {
       setFailed(true);
     } finally {
+      setSaving(false);
       setPending(false);
     }
   }
 
   const status = pairing?.status;
+  const ended = status !== undefined && terminal.includes(status);
   return (
-    <dialog ref={dialog} className="a13n-qq-dialog a13n-weixin-pairing" aria-labelledby={titleId}
-      aria-describedby={`${titleId}-description`}
-      onCancel={(event) => { event.preventDefault(); if (!pending || status !== "confirmed") dismiss(); }}>
-      <ChannelEditorHeader account={account} text={text} titleId={titleId} />
-      {!pairing && <p>{text.scan}</p>}
-      {pairing && status !== "confirmed" && !terminal.includes(pairing.status) &&
-        <img className="a13n-weixin-qr" src={pairing.qr_image} alt={text.qr} />}
+    <>
+      {status !== "confirmed" && (pairing && !ended
+        ? <img className="a13n-pairing-qr" src={pairing.qr_image} alt={text.qr} />
+        : <PairingQRPlaceholder text={text} pending={pending} requestCode={() => void run()} />)}
       {status === "confirmed" && <div className="a13n-qq-authorized" role="status">
         <span aria-hidden="true">✓</span><strong>{text.qqScanReady}</strong>
       </div>}
@@ -513,14 +629,15 @@ function PairingDialog({ account, text, dismiss, requestDelete }: {
         <Button type="submit" disabled={pending}>{text.verify}</Button>
       </form>}
       {failed && <p role="alert">{text.error}</p>}
+      {failed && pairing && !ended && status !== "confirmed" &&
+        <Button type="button" variant="outline" disabled={pending} onClick={() => void run()}>{text.getCode}</Button>}
       <div className="a13n-qq-actions">
-        <Button className="a13n-channel-delete" variant="destructive-outline" disabled={pending}
-          onClick={() => requestDelete(account)}>{text.remove}</Button>
-        {status !== "confirmed" && <Button variant="outline" disabled={pending} onClick={() => void run()}>{text.getCode}</Button>}
+        {account && <Button className="a13n-channel-delete" variant="destructive-outline" disabled={pending}
+          onClick={() => requestDelete(account)}>{text.remove}</Button>}
         <Button variant="outline" disabled={pending && status === "confirmed"} onClick={dismiss}>{text.cancel}</Button>
         <Button disabled={pending || status !== "confirmed"} onClick={() => void savePairing()}>{text.save}</Button>
       </div>
-    </dialog>
+    </>
   );
 }
 
@@ -530,7 +647,6 @@ function Channels({ nav }: { nav: React.ReactNode }) {
   const { i18n } = useTranslation();
   const text = i18n.language.startsWith("zh") ? chinese : english;
   const [action, setAction] = React.useState<Action | null>(null);
-  const [pairing, setPairing] = React.useState<Account | null>(null);
   const [deleting, setDeleting] = React.useState<Account | null>(null);
   const query = useQuery({
     queryKey: app.queryKey("channel-accounts"),
@@ -542,13 +658,13 @@ function Channels({ nav }: { nav: React.ReactNode }) {
   if (!query.data) return <ErrorPage error={query.error} />;
   const { accounts, configured, qq_scan_available, connectors = [] } = query.data;
   const editable = can("write") && !workspace?.archived_at;
-  const editChannel = (account: Account) => {
-    if (account.platform === "weixin") setPairing(account);
-    else setAction({ kind: "edit", account });
-  };
+  const withCurrentName = (account: Account) => ({
+    ...account,
+    name: accounts.find(item => item.id === account.id)?.name ?? account.name,
+  });
+  const editChannel = (account: Account) => setAction({ kind: "edit", account });
   const finishDelete = () => {
     setDeleting(null);
-    setPairing(null);
     setAction(null);
   };
   const addChannel = editable ? <Button onClick={() => setAction({ kind: "add" })}>{text.add}</Button> : undefined;
@@ -596,12 +712,11 @@ function Channels({ nav }: { nav: React.ReactNode }) {
           </table>
         </div>
       )}
-      {editable && pairing && <PairingDialog account={pairing} text={text}
-        dismiss={() => setPairing(null)} requestDelete={setDeleting} />}
-      {editable && action && <AccountDialog key={action.kind} action={action} text={text}
-        dismiss={() => setAction(null)} pair={setPairing} requestDelete={setDeleting}
+      {editable && action && <AccountDialog key={action.kind}
+        action={action.kind === "edit" ? { ...action, account: withCurrentName(action.account) } : action} text={text}
+        dismiss={() => setAction(null)} requestDelete={setDeleting}
         qqScanAvailable={qq_scan_available} connectors={connectors} />}
-      {editable && deleting && <DeleteChannelDialog account={deleting} text={text}
+      {editable && deleting && <DeleteChannelDialog account={withCurrentName(deleting)} text={text}
         dismiss={() => setDeleting(null)} onDeleted={finishDelete} />}
     </Page>
   );

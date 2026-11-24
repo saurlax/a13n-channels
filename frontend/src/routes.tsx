@@ -1,6 +1,6 @@
 import {
-  React, ApiError, Badge, Button, ChoiceField, Empty, ErrorPage, Input, Link, Loading, Page, Switch,
-  useAccess, useApp, useNavigate, useQuery, useQueryClient, useTranslation,
+  React, ApiError, Badge, Button, ChoiceField, Empty, ErrorPage, FormField, Input, Link, Loading, Page, Switch,
+  useAccess, useApp, useNavigate, useQuery, useQueryClient, useToast, useTranslation,
 } from "@a13n/console";
 import { ChannelIcon, type Platform } from "./channel-icon";
 import { ChannelSelect } from "./select";
@@ -8,8 +8,13 @@ import { ChannelSelect } from "./select";
 const english = {
   title: "Channels", name: "Name", sources: "Sources", channel: "Channel account",
   kind: "Conversation type", conversation: "Conversation", conversationId: "Conversation ID", agent: "Target Agent",
-  status: "Status", enable: "Enable route", enabled: "Enabled", paused: "Paused", attention: "Needs attention",
+  status: "Status", enable: "Enable route", enabled: "Enabled", paused: "Paused",
   add: "Add route", routes: "Delivery routes", empty: "No routes yet", missingRoute: "Route not found",
+  resetConversations: "Reset conversations",
+  confirmReset: "Confirm reset",
+  resetBody: "Clear this route’s Thread bindings and fixed Thread ID. The next matching message starts a new Thread. Active runs continue, and earlier conversations remain available.",
+  resetDone: "Conversations reset. New deliveries start with new Threads.",
+  resetError: "Could not reset conversations. Try again.",
   addSource: "Add source", removeSource: "Remove source", selectAgent: "Select a published Agent",
   anyChannel: "All channel accounts", anyConversation: "All conversations", conversationPlaceholder: "All conversations when empty", removeConversation: "Remove conversation",
   sourceLimit: "Use at most 100 source rules, counting each conversation ID.",
@@ -24,12 +29,14 @@ const english = {
   wakeAgent: "Wake Agent", noWakeAgent: "None",
   wakeHelp: "Decides whether matching messages reach the target Agent. Configure the criteria in the wake Agent’s instructions.",
   wakeError: "Choose a different published Agent in this workspace.",
-  issue: "Issue", pullRequest: "Pull Request", channelKind: "Channel", thread: "Thread", topic: "MQTT topic", allKinds: "All conversation types",
+  issue: "Issue", pullRequest: "Pull Request", channelKind: "Channel", thread: "Thread", topic: "MQTT topic", topicFilter: "MQTT subscription filter", mqttReply: "MQTT reply topic", mqttSourceTopic: "Default reply topic", mqttSourceError: "Enter an MQTT subscription filter in Sources.", allKinds: "All conversation types",
   cancel: "Cancel", save: "Save", remove: "Delete", deleteTitle: "Delete route",
   deleteError: "The route could not be deleted. Try again.",
   deleteBody: "New messages will stop using this route. Existing Console conversations are retained.",
   unconfigured: "Channels storage is not configured.",
   threadPolicy: "Thread behavior", fixedThreadId: "Thread ID (optional)",
+  contextIdle: "Context retention (seconds)",
+  contextIdleHelp: "After this much idle time, the next message starts a new Session.",
   policies: { conversation: "Reuse by conversation", sender: "Reuse by sender", fixed: "Reuse one Thread", message: "New Thread for each message" },
   policyHelp: {
     conversation: "Each channel account and conversation has its own history.",
@@ -48,8 +55,13 @@ const english = {
 const chinese: typeof english = {
   title: "渠道", name: "名称", sources: "来源", channel: "渠道账号",
   kind: "会话类型", conversation: "会话", conversationId: "会话 ID", agent: "目标 Agent",
-  status: "状态", enable: "启用路由", enabled: "已启用", paused: "已停用", attention: "投递异常",
+  status: "状态", enable: "启用路由", enabled: "已启用", paused: "已停用",
   add: "添加路由", routes: "投递路由", empty: "暂无投递路由", missingRoute: "找不到路由",
+  resetConversations: "重置会话",
+  confirmReset: "确认重置",
+  resetBody: "这会清除当前路由的 Thread 绑定和固定 Thread ID。下一条符合条件的消息会开启新 Thread，运行中的任务会继续，历史会话仍可查看。",
+  resetDone: "会话已重置。后续投递将使用新 Thread。",
+  resetError: "未能重置会话，请重试。",
   addSource: "添加来源", removeSource: "移除来源", selectAgent: "选择已发布的 Agent",
   anyChannel: "全部渠道账号", anyConversation: "全部会话", conversationPlaceholder: "留空匹配全部会话", removeConversation: "移除会话",
   sourceLimit: "来源规则最多 100 条，每个会话 ID 各算一条。",
@@ -64,12 +76,14 @@ const chinese: typeof english = {
   wakeAgent: "唤醒 Agent", noWakeAgent: "不使用",
   wakeHelp: "决定匹配的消息是否交给目标 Agent。判断条件写在唤醒 Agent 的指令里。",
   wakeError: "请选择当前工作区内另一个已发布的 Agent。",
-  issue: "Issue", pullRequest: "Pull Request", channelKind: "频道", thread: "话题", topic: "MQTT 主题", allKinds: "全部会话类型",
+  issue: "Issue", pullRequest: "Pull Request", channelKind: "频道", thread: "话题", topic: "MQTT 主题", topicFilter: "MQTT 接收主题", mqttReply: "MQTT 回复主题", mqttSourceTopic: "按默认设置回复", mqttSourceError: "请在「来源」中填写 MQTT 接收主题。", allKinds: "全部会话类型",
   cancel: "取消", save: "保存", remove: "删除", deleteTitle: "删除路由",
   deleteError: "未能删除路由，请重试。",
   deleteBody: "新消息将不再使用这条路由。已有的 Console 会话会保留。",
   unconfigured: "尚未配置渠道存储。",
   threadPolicy: "Thread 投递模式", fixedThreadId: "Thread ID（选填）",
+  contextIdle: "上下文保留时间（秒）",
+  contextIdleHelp: "空闲达到此时长后，下一条消息会开启新会话。",
   policies: { conversation: "按会话复用", sender: "按会话内发送者复用", fixed: "固定 Thread", message: "每条消息新建 Thread" },
   policyHelp: {
     conversation: "每个渠道账号下的每个会话都有独立的上下文。",
@@ -94,10 +108,12 @@ const threadPolicies: ThreadPolicy[] = ["conversation", "sender", "fixed", "mess
 type RouteInput = {
   name: string; agent_id: string; enabled: boolean; sources: Source[];
   thread_policy: ThreadPolicy; fixed_thread_id: string | null;
+  context_idle_seconds: number;
   multiparty_messages: MultipartyFilter | null; wake_agent_id: string | null;
   allowed_users: Record<string, string[]>;
+  mqtt_reply_topic?: string | null;
 };
-type Route = RouteInput & { id: string; attention: number; needs_authorization: boolean };
+type Route = RouteInput & { id: string; needs_authorization: boolean };
 type RouteList = { configured: boolean; routes: Route[] };
 type Text = typeof english;
 
@@ -179,9 +195,10 @@ function SourceEditor({ source, accounts, update, remove, text, disabled }: {
   const optionsId = React.useId();
   const account = accounts.find(item => item.id === source.channel_id);
   const github = isGitHub(account);
+  const mqtt = account?.platform === "mqtt";
   const supported = ["*", ...(account?.conversation_kinds ?? [])];
   const kind = account ? source.kind : "*";
-  const conversationLabel = github ? text.repository : text.conversationId;
+  const conversationLabel = github ? text.repository : mqtt ? text.topicFilter : text.conversationId;
   function addConversation() {
     const value = source.input.trim();
     if (value === "*" || (github && value && !validRepo(value))) return;
@@ -206,7 +223,9 @@ function SourceEditor({ source, accounts, update, remove, text, disabled }: {
             ...(source.channel_id && source.channel_id !== "*" && !account
               ? [{ value: source.channel_id, label: `${text.missing} (${source.channel_id})` }] : []),
           ]}
-          onChange={id => update({ ...sourceDefaults(), channel_id: id })} />
+          onChange={id => update({
+            ...sourceDefaults(), channel_id: id, kind: accounts.find(item => item.id === id)?.platform === "mqtt" ? "topic" : "*",
+          })} />
       </td>
       <td>
         <ChannelSelect label={text.kind} disabled={disabled || !account} value={kind}
@@ -230,7 +249,7 @@ function SourceEditor({ source, accounts, update, remove, text, disabled }: {
               </span>
             ))}
             <Input unstyled aria-label={conversationLabel} disabled={disabled} list={github ? undefined : optionsId}
-              placeholder={github ? "owner/repo" : source.conversations.length ? conversationLabel : text.conversationPlaceholder}
+              placeholder={github ? "owner/repo" : mqtt ? "devices/+/alerts" : source.conversations.length ? conversationLabel : text.conversationPlaceholder}
               value={source.input} maxLength={github ? 150 : 512}
               pattern={github ? repoPattern : String.raw`(?!\s*\*\s*$).*`}
               onChange={event => update({ ...source, input: event.currentTarget.value })}
@@ -256,15 +275,25 @@ function SourceEditor({ source, accounts, update, remove, text, disabled }: {
   );
 }
 
-function RouteDelete({ route, text, dismiss, onDeleted }: {
-  route: Route; text: Text; dismiss: () => void; onDeleted: () => void;
+type RouteAction = "reset" | "delete";
+
+function RouteConfirmation({ route, action, text, dismiss, onConfirmed }: {
+  route: Route; action: RouteAction; text: Text; dismiss: () => void; onConfirmed: () => void;
 }) {
   const app = useApp();
   const dialog = React.useRef<HTMLDialogElement>(null);
   const titleId = React.useId();
+  const descriptionId = React.useId();
+  const resetting = action === "reset";
+  const title = resetting ? text.resetConversations : text.deleteTitle;
   const [pending, setPending] = React.useState(false);
   const [failed, setFailed] = React.useState(false);
   React.useEffect(() => { dialog.current?.showModal(); }, []);
+
+  function cancel() {
+    dialog.current?.close();
+    dismiss();
+  }
 
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -272,8 +301,10 @@ function RouteDelete({ route, text, dismiss, onDeleted }: {
     setPending(true);
     setFailed(false);
     try {
-      await app.request(`/routes/${encodeURIComponent(route.id)}`, { method: "DELETE" });
-      onDeleted();
+      const path = `/routes/${encodeURIComponent(route.id)}`;
+      await app.request(resetting ? `${path}/reset-conversations` : path, { method: resetting ? "POST" : "DELETE" });
+      dialog.current?.close();
+      onConfirmed();
     } catch {
       setFailed(true);
       setPending(false);
@@ -281,18 +312,18 @@ function RouteDelete({ route, text, dismiss, onDeleted }: {
   }
 
   return (
-    <dialog className="a13n-qq-dialog" ref={dialog} aria-labelledby={titleId}
-      onCancel={event => { event.preventDefault(); if (!pending) dismiss(); }}>
+    <dialog className="a13n-qq-dialog" ref={dialog} aria-labelledby={titleId} aria-describedby={descriptionId}
+      onCancel={event => { event.preventDefault(); if (!pending) cancel(); }}>
       <form onSubmit={submit}>
         <header className="a13n-channel-edit-header">
-          <h2 id={titleId}>{text.deleteTitle}</h2>
+          <h2 id={titleId}>{title}</h2>
           <p>{route.name}</p>
         </header>
-        <p>{text.deleteBody}</p>
-        {failed && <p role="alert">{text.deleteError}</p>}
+        <p id={descriptionId}>{resetting ? text.resetBody : text.deleteBody}</p>
+        {failed && <p role="alert">{resetting ? text.resetError : text.deleteError}</p>}
         <div className="a13n-qq-actions">
-          <Button type="button" variant="outline" disabled={pending} onClick={dismiss}>{text.cancel}</Button>
-          <Button type="submit" variant="destructive" disabled={pending}>{text.deleteTitle}</Button>
+          <Button type="button" variant="outline" disabled={pending} onClick={cancel}>{text.cancel}</Button>
+          <Button type="submit" variant="destructive" disabled={pending}>{resetting ? text.confirmReset : title}</Button>
         </div>
       </form>
     </dialog>
@@ -303,7 +334,9 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
   route?: Route; accounts: Account[]; agents: Agent[]; text: Text; back: string; canEdit: boolean;
 }) {
   const app = useApp();
+  const { can } = useAccess();
   const client = useQueryClient();
+  const toast = useToast();
   const navigate = useNavigate();
   const [name, setName] = React.useState(route?.name ?? "");
   const [agent, setAgent] = React.useState(route?.agent_id ?? "");
@@ -314,8 +347,7 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
   );
   const [policy, setPolicy] = React.useState<ThreadPolicy>(route?.thread_policy ?? "conversation");
   const [threadId, setThreadId] = React.useState(route?.fixed_thread_id ?? "");
-  const threadHelpId = React.useId();
-  const enabledId = React.useId();
+  const [contextIdle, setContextIdle] = React.useState(String(route?.context_idle_seconds ?? 3600));
   const [enabled, setEnabled] = React.useState(route?.enabled ?? true);
   const [sources, setSources] = React.useState(
     () => (route ? draftSources(route.sources) : [sourceDefaults()]).map((value, id) => ({ id, value })),
@@ -323,17 +355,32 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
   const [allowedUsers, setAllowedUsers] = React.useState<UserDraft[]>(() =>
     Object.entries(route?.allowed_users ?? {}).map(([channelId, users], id) => ({ id, channelId, users: users.join(", ") })),
   );
+  const [mqttReplyTopic, setMQTTReplyTopic] = React.useState(route?.mqtt_reply_topic ?? "");
+  const hasMQTTSource = sources.some(({ value }) => value.channel_id === "*" ||
+    accounts.some(account => account.id === value.channel_id && account.platform === "mqtt"));
   const nextUser = React.useRef(allowedUsers.length);
   const nextSource = React.useRef(sources.length);
-  const [deleting, setDeleting] = React.useState(false);
+  const [confirming, setConfirming] = React.useState<RouteAction | null>(null);
   const [pending, setPending] = React.useState(false);
   const [error, setError] = React.useState("");
   const disabled = pending || !canEdit;
   const canRemoveSource = canEdit && sources.length > 1;
+  const managesContext = policy !== "message" && !(policy === "fixed" && threadId.trim());
 
   function returnToList() {
     void client.invalidateQueries({ queryKey: app.queryKey("channel-routes") });
     navigate(back);
+  }
+
+  function finishAction() {
+    setConfirming(null);
+    if (confirming === "delete") {
+      returnToList();
+    } else {
+      setThreadId("");
+      void client.invalidateQueries({ queryKey: app.queryKey("channel-routes") });
+      toast.add({ type: "success", title: text.resetDone });
+    }
   }
 
   async function submit(event: React.FormEvent<HTMLFormElement>) {
@@ -378,14 +425,18 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
         body: JSON.stringify({
           name, agent_id: agent, enabled,
           sources: savedSources, allowed_users: Object.fromEntries(usersByAccount),
+          mqtt_reply_topic: hasMQTTSource ? mqttReplyTopic.trim() || null : null,
           multiparty_messages: multiparty === "legacy" ? null : multiparty, wake_agent_id: wakeAgent || null,
           thread_policy: policy, fixed_thread_id: policy === "fixed" ? threadId.trim() || null : null,
+          context_idle_seconds: managesContext ? Number(contextIdle) : route?.context_idle_seconds ?? 3600,
         } satisfies RouteInput),
       });
       returnToList();
     } catch (error) {
       if (error instanceof ApiError && error.details.reason === "thread_destination_busy") {
         setError(text.busyThread);
+      } else if (error instanceof ApiError && error.details.field === "mqtt_source") {
+        setError(text.mqttSourceError);
       } else if (error instanceof ApiError && error.details.field === "repository") {
         setError(text.githubError);
       } else if (error instanceof ApiError && error.details.field === "allowed_users") {
@@ -402,11 +453,13 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
   }
 
   return (
-    <Page title={route?.name ?? text.add} back={back} backLabel={text.routes}>
+    <Page className="a13n-route-page" title={route?.name ?? text.add} back={back} backLabel={text.routes}>
       <form className="a13n-route-form" onSubmit={submit}>
         <div className="a13n-route-settings">
-          <label>{text.name}<Input required maxLength={80} disabled={disabled}
-            value={name} onChange={event => setName(event.currentTarget.value)} /></label>
+          <FormField label={text.name} data-field-layout="stacked" className="a13n-route-text-field">
+            <Input required maxLength={80} disabled={disabled}
+              value={name} onChange={event => setName(event.currentTarget.value)} />
+          </FormField>
           <ChoiceField label={text.agent} required disabled={disabled} value={agent || undefined}
             placeholder={text.selectAgent} onValueChange={value => { setAgent(value); if (value === wakeAgent) setWakeAgent(""); }}
             options={[
@@ -414,21 +467,21 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
               ...(agent && !agents.some(item => item.id === agent)
                 ? [{ value: agent, label: `${text.missing} (${agent})`, disabled: true }] : []),
             ]} />
-          <div className="a13n-route-enabled">
-            <label htmlFor={enabledId}>{text.enable}</label>
-            <Switch id={enabledId} checked={enabled} disabled={disabled} onCheckedChange={setEnabled} />
-          </div>
+          <FormField label={text.enable} data-field-layout="setting" className="a13n-route-enabled">
+            <Switch checked={enabled} disabled={disabled} onCheckedChange={setEnabled} />
+          </FormField>
         </div>
-        <section className="a13n-route-sources" aria-label={text.threadPolicy}>
-          <div className="a13n-route-settings">
-            <ChoiceField label={text.threadPolicy} disabled={disabled} value={policy}
-              aria-describedby={threadHelpId} onValueChange={value => setPolicy(value as ThreadPolicy)}
-              options={threadPolicies.map(value => ({ value, label: text.policies[value] }))} />
-            {policy === "fixed" && <label>{text.fixedThreadId}<Input disabled={disabled} maxLength={512}
-              value={threadId} onChange={event => setThreadId(event.currentTarget.value)}
-              aria-describedby={threadHelpId} /></label>}
-          </div>
-          <p id={threadHelpId} className="a13n-route-thread-help">{text.policyHelp[policy]}</p>
+        <section className="a13n-route-settings" aria-label={text.threadPolicy}>
+          <ChoiceField label={text.threadPolicy} description={text.policyHelp[policy]} disabled={disabled} value={policy}
+            onValueChange={value => setPolicy(value as ThreadPolicy)}
+            options={threadPolicies.map(value => ({ value, label: text.policies[value] }))} />
+          {policy === "fixed" && <FormField label={text.fixedThreadId} data-field-layout="stacked" className="a13n-route-text-field">
+            <Input disabled={disabled} maxLength={512} value={threadId} onChange={event => setThreadId(event.currentTarget.value)} />
+          </FormField>}
+          {managesContext && <FormField label={text.contextIdle} description={text.contextIdleHelp} data-field-layout="setting">
+            <Input type="number" required disabled={disabled} min={1} max={Number.MAX_SAFE_INTEGER} step={1}
+              value={contextIdle} onChange={event => setContextIdle(event.currentTarget.value)} />
+          </FormField>}
         </section>
         <section className="a13n-route-sources" aria-label={text.sources}>
           <div className="a13n-route-section-header">
@@ -455,6 +508,10 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
               </tbody>
             </table>
           </div>
+          {hasMQTTSource && <div className="a13n-route-settings"><label>{text.mqttReply}
+            <Input disabled={disabled} value={mqttReplyTopic} maxLength={512} pattern={String.raw`(?!\s*\*\s*$)[^+#]*`}
+              placeholder={text.mqttSourceTopic} onChange={event => setMQTTReplyTopic(event.currentTarget.value)} />
+          </label></div>}
         </section>
         <section className="a13n-route-sources" aria-label={text.filters}>
           <div className="a13n-route-section-header"><h2>{text.filters}</h2></div>
@@ -466,7 +523,7 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
                 { value: "all", label: text.allMessages },
                 ...(legacyFilters ? [{ value: "legacy", label: text.originalFilters }] : []),
               ]} />
-            <ChoiceField label={text.wakeAgent} disabled={disabled} value={wakeAgent || "none"}
+            <ChoiceField label={text.wakeAgent} description={text.wakeHelp} disabled={disabled} value={wakeAgent || "none"}
               onValueChange={value => setWakeAgent(value === "none" ? "" : value)}
               options={[
                 { value: "none", label: text.noWakeAgent },
@@ -475,7 +532,6 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
                   ? [{ value: wakeAgent, label: `${text.missing} (${wakeAgent})`, disabled: true }] : []),
               ]} />
           </div>
-          <p className="a13n-route-thread-help">{text.wakeHelp}</p>
           <div className="a13n-route-section-header">
             <h3>{text.allowedUsers}</h3>
             {canEdit && <Button type="button" size="sm" variant="outline" disabled={disabled || !accounts.length || allowedUsers.length >= 100}
@@ -524,16 +580,21 @@ function RouteEditor({ route, accounts, agents, text, back, canEdit }: {
         {canEdit && <>
           <p className="a13n-route-notice">{text.routeAuthority}</p>
           <div className="a13n-qq-actions a13n-route-form-actions">
-            {route && <Button type="button" className="a13n-channel-delete" variant="destructive-outline"
-              disabled={pending} onClick={() => setDeleting(true)}>{text.remove}</Button>}
-            <Button type="button" variant="outline" disabled={pending} onClick={() => navigate(back)}>{text.cancel}</Button>
-            <Button type="submit" disabled={pending || !agents.some(item => item.id === agent) || !name.trim()}>
+            {route && <div className="a13n-qq-actions a13n-route-maintenance">
+              {can("run") && <Button type="button" variant="destructive-outline" disabled={disabled}
+                onClick={() => setConfirming("reset")}>{text.resetConversations}</Button>}
+              <Button type="button" variant="destructive-outline"
+                disabled={disabled} onClick={() => setConfirming("delete")}>{text.remove}</Button>
+            </div>}
+            <Button type="button" variant="outline" disabled={disabled} onClick={() => navigate(back)}>{text.cancel}</Button>
+            <Button type="submit" disabled={disabled || !agents.some(item => item.id === agent) || !name.trim()}>
               {text.save}
             </Button>
           </div>
         </>}
       </form>
-      {route && deleting && <RouteDelete route={route} text={text} dismiss={() => setDeleting(false)} onDeleted={returnToList} />}
+      {route && confirming && <RouteConfirmation route={route} action={confirming} text={text}
+        dismiss={() => setConfirming(null)} onConfirmed={finishAction} />}
     </Page>
   );
 }
@@ -638,9 +699,6 @@ export function RoutePage({ nav, base, routeKey }: { nav: React.ReactNode; base:
                           </span>
                           {route.needs_authorization && <span className="a13n-channel-status" data-tone="warning">
                             {text.needsAuthorization}
-                          </span>}
-                          {route.attention > 0 && <span className="a13n-channel-status" data-tone="warning">
-                            {text.attention} ({route.attention})
                           </span>}
                         </td>
                       </tr>
