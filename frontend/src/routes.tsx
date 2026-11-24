@@ -8,7 +8,7 @@ import { ChannelSelect } from "./select";
 const english = {
   title: "Channels", name: "Name", sources: "Sources", channel: "Channel account",
   kind: "Conversation type", conversation: "Conversation", conversationId: "Conversation ID", agent: "Target Agent",
-  status: "Status", enable: "Enable route", enabled: "Enabled", paused: "Paused", attention: "Needs attention",
+  status: "Status", enable: "Enable route", enabled: "Enabled", paused: "Paused",
   add: "Add route", routes: "Delivery routes", empty: "No routes yet", missingRoute: "Route not found",
   resetConversations: "Reset conversations",
   confirmReset: "Confirm reset",
@@ -55,7 +55,7 @@ const english = {
 const chinese: typeof english = {
   title: "渠道", name: "名称", sources: "来源", channel: "渠道账号",
   kind: "会话类型", conversation: "会话", conversationId: "会话 ID", agent: "目标 Agent",
-  status: "状态", enable: "启用路由", enabled: "已启用", paused: "已停用", attention: "投递异常",
+  status: "状态", enable: "启用路由", enabled: "已启用", paused: "已停用",
   add: "添加路由", routes: "投递路由", empty: "暂无投递路由", missingRoute: "找不到路由",
   resetConversations: "重置会话",
   confirmReset: "确认重置",
@@ -112,7 +112,7 @@ type RouteInput = {
   multiparty_messages: MultipartyFilter | null; wake_agent_id: string | null;
   allowed_users: Record<string, string[]>;
 };
-type Route = RouteInput & { id: string; attention: number; needs_authorization: boolean };
+type Route = RouteInput & { id: string; needs_authorization: boolean };
 type RouteList = { configured: boolean; routes: Route[] };
 type Text = typeof english;
 
@@ -685,9 +685,6 @@ export function RoutePage({ nav, base, routeKey }: { nav: React.ReactNode; base:
                           </span>
                           {route.needs_authorization && <span className="a13n-channel-status" data-tone="warning">
                             {text.needsAuthorization}
-                          </span>}
-                          {route.attention > 0 && <span className="a13n-channel-status" data-tone="warning">
-                            {text.attention} ({route.attention})
                           </span>}
                         </td>
                       </tr>

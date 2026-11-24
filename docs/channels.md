@@ -75,7 +75,7 @@ Select a channel account to see its supported conversation types. For chat chann
 
 Under **Filters**, choose whether group and guild messages must mention the bot or whether all received messages qualify. This applies across the route's sources. Private messages always pass this filter. New routes in Console default to mentions only. Older routes retain their saved behavior until a route-wide filter is selected. The mention filter applies to the highest-priority matching route.
 
-Choose a different published **Wake Agent** to decide whether a qualifying message reaches the target Agent. Configure the decision criteria in the wake Agent's instructions. Each decision runs in a separate Thread and returns a boolean. A positive decision delivers the original message to the target Agent under its configured Thread policy. A negative decision skips delivery. A failed decision appears in route status.
+Choose a different published **Wake Agent** to decide whether a qualifying message reaches the target Agent. Configure the decision criteria in the wake Agent's instructions. Each decision runs in a separate Thread and returns a boolean. A positive decision delivers the original message to the target Agent under its configured Thread policy. A negative or failed decision skips delivery. Open the Wake Agent's decision Thread in Console to inspect the run.
 
 Matching sources are ranked by exact conversation ID, repository, specific account, then specific conversation type. Saving equally specific overlaps is rejected. A paused matching rule prevents fallback to a more general rule. Messages with no enabled matching rule stay in channel storage. Creating or enabling a route does not replay them.
 
