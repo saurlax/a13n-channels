@@ -61,7 +61,8 @@ class Socket:
         self.close_codes.append(code)
 
 
-def test_gateway_receives_reconnects_and_replies_in_the_original_channel(monkeypatch):
+@pytest.mark.parametrize("flags", [0, 1 << 18, 1 << 19])
+def test_gateway_receives_reconnects_and_replies_in_the_original_channel(monkeypatch, flags):
     async def exercise():
         requests = []
         sockets = [
@@ -95,6 +96,8 @@ def test_gateway_receives_reconnects_and_replies_in_the_original_channel(monkeyp
                 return httpx.Response(200, json={"id": BOT_ID, "bot": True})
             if request.url.path == "/api/v10/gateway/bot":
                 return httpx.Response(200, json={"url": "wss://gateway.discord.gg"})
+            if request.url.path == "/api/v10/applications/@me":
+                return httpx.Response(200, json={"flags": flags})
             assert request.url.path == f"/api/v10/channels/{CHANNEL_ID}/messages"
             assert json.loads(request.content) == {
                 "content": "reply @everyone",
@@ -112,7 +115,7 @@ def test_gateway_receives_reconnects_and_replies_in_the_original_channel(monkeyp
         monkeypatch.setattr(discord, "connect", connect)
         monkeypatch.setattr(discord.random, "random", lambda: 1)
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-            config = {"bot_token": TOKEN, "message_content": "true"}
+            config = {"bot_token": TOKEN}
             identity = await discord.ADAPTER.bind(http, config)
             connection = discord.ADAPTER.connect(http, "account", identity, config)
             await connection._socket(ingest, status.append)
@@ -122,9 +125,8 @@ def test_gateway_receives_reconnects_and_replies_in_the_original_channel(monkeyp
         assert identity == BOT_ID
         assert addresses == [GATEWAY, RESUME, GATEWAY]
         assert sockets[0].sent[0]["op"] == 2
-        assert (
-            sockets[0].sent[0]["d"]["intents"]
-            == discord.GUILD_MESSAGES | discord.DIRECT_MESSAGES | discord.MESSAGE_CONTENT
+        assert sockets[0].sent[0]["d"]["intents"] == discord.GUILD_MESSAGES | discord.DIRECT_MESSAGES | (
+            discord.MESSAGE_CONTENT if flags else 0
         )
         assert sockets[0].sent[1] == {"op": 1, "d": 3}
         assert sockets[1].sent[0] == {"op": 6, "d": {"token": TOKEN, "session_id": "test-session", "seq": 3}}
@@ -136,7 +138,7 @@ def test_gateway_receives_reconnects_and_replies_in_the_original_channel(monkeyp
             ("103", "private", None),
         ]
         assert all(message.channel_id == "account" and message.conversation_id == CHANNEL_ID for message in messages)
-        assert [request.method for request in requests] == ["GET", "GET", "POST"]
+        assert [request.method for request in requests] == ["GET", "GET", "GET", "POST"]
 
     asyncio.run(exercise())
 
@@ -203,7 +205,5 @@ def test_binding_and_rest_failures_keep_credentials_private_and_only_retry_refus
 def test_message_content_intent_and_gateway_origin_validation():
     assert discord._message("account", BOT_ID, {**incoming(), "content": "", "mentions": []}) is None
     assert discord._message("account", BOT_ID, {**incoming(), "mentions": []}).bot_mentioned is False
-    with pytest.raises(ChannelError, match="true or false"):
-        discord._intents({"message_content": "maybe"})
     with pytest.raises(ValueError, match="endpoint"):
         discord._gateway_url("wss://gateway.discord.gg@example.com")
