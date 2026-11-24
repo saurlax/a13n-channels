@@ -25,15 +25,9 @@ In **Apps → Channels → Add channel**, choose **QQ Bot** and enter its name, 
 
 ### QQ QR binding
 
-Install Tencent's connector in the Service runtime alongside Node.js 18 or later. The App uses the connector's default third-party identity on the authorization screen.
+Select **Scan QR code** under **QQ Bot**, then click **Get QR code**. Service requests the code from `q.qq.com`. Scan it in the QQ mobile app and approve the binding under QQ's third-party authorization screen.
 
-```bash
-npm install --prefix /opt/a13n/qq-connector --ignore-scripts @tencent-connect/qqbot-connector@1.2.0
-```
-
-Add `qq_connector_path = "/opt/a13n/qq-connector/node_modules/@tencent-connect/qqbot-connector"` to the existing `[channels]` settings section and restart Service. If the connector must use the deployment's HTTPS proxy, set `NODE_USE_ENV_PROXY=1` in the Service process environment on a Node version that supports it.
-
-With the connector configured, select **Scan QR code** under **QQ Bot**, then click **Get QR code** in the QR placeholder. Scan the code in the QQ mobile app and approve the binding to confirm authorization. After authorization, Channels automatically opens a temporary QQ WebSocket and waits for the platform to report readiness. Use **Test connection** to retry or to check manually entered credentials. Click **Save** to add the channel. Service saves the returned credentials in the workspace using the same encrypted storage as manual setup. Select **Enter credentials** to add a bot manually. Deployments without the connector can continue using manual setup.
+After authorization, Channels opens a temporary QQ WebSocket to test the credentials. Use **Test connection** to retry and **Save** to add the channel. Service stores the returned credentials in the same encrypted workspace storage used by **Enter credentials**.
 
 ### Weixin pairing
 

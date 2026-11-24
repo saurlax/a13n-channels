@@ -78,7 +78,6 @@ LEGACY_CONVERSATION_KINDS = {
 
 class ChannelsSettings(Section):
     state_path: Path | None = None
-    qq_connector_path: Path | None = None
 
 
 class QQEdit(BaseModel):
@@ -127,8 +126,6 @@ class ChannelsRuntime:
         self.pairings: dict[str | tuple[str, str, str], Pairing] = {}
         self.qq_scans = QQScans()
         self.qq_probes: set[str] = set()
-        settings = runtime.settings.extensions.get(SETTINGS, ChannelsSettings())
-        self.qq_connector = settings.qq_connector_path
         self.deliveries = Deliveries(store, runtime, self.send_reply)
 
     def view(self, row: sqlite3.Row) -> QQAccount:
@@ -484,7 +481,7 @@ def definition() -> AppDefinition:
         return ChannelList(
             configured=True,
             accounts=[channels.channel_view(row) for row in rows],
-            qq_scan_available=channels.qq_connector is not None,
+            qq_scan_available=True,
             connectors=[
                 ConnectorDescription(key=item.key, label=item.label, label_zh=item.label_zh, fields=item.fields)
                 for item in ADAPTERS.values()
@@ -865,12 +862,10 @@ def definition() -> AppDefinition:
     ) -> QQScanStatus:
         await writable_scope(runtime, actor, workspace_id)
         active = require_channels()
-        if active.qq_connector is None:
-            raise ServiceError("unavailable", "Configure the Tencent QQ Connector to enable QR binding.")
         key = (workspace_id, actor.id)
         scans = active.qq_scans
         previous = scans.sessions.get(key)
-        login = QQScan(active.qq_connector)
+        login = QQScan(active.http)
         scans.sessions[key] = login
         try:
             if previous is not None:
